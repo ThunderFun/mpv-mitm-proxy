@@ -1,10 +1,11 @@
-use dashmap::DashMap;
+use lru::LruCache;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -27,24 +28,24 @@ struct CaData {
 
 pub struct CertificateAuthority {
     ca_data: Mutex<Option<CaData>>,
-    cache: DashMap<String, Arc<ServerConfig>>,
+    cache: Mutex<LruCache<String, Arc<ServerConfig>>>,
 }
 
 impl CertificateAuthority {
     pub fn new() -> Result<Self, CertError> {
         Ok(Self {
             ca_data: Mutex::new(None),
-            cache: DashMap::new(),
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
         })
     }
-    
+
     fn ensure_initialized(&self) -> Result<(), CertError> {
         let mut ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
-        
+
         if ca_data.is_some() {
             return Ok(());
         }
-        
+
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
         let mut ca_params = CertificateParams::default();
@@ -66,28 +67,37 @@ impl CertificateAuthority {
 
         let ca_cert = ca_params.self_signed(&ca_key)?;
         *ca_data = Some(CaData { ca_cert, ca_key });
-        
+
         Ok(())
     }
 
     pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
-        if let Some(config) = self.cache.get(hostname) {
-            return Ok(Arc::clone(&config));
+        {
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            if let Some(config) = cache.get(hostname) {
+                return Ok(Arc::clone(config));
+            }
         }
 
         self.ensure_initialized()?;
-        
+
         let config = self.generate_server_config(hostname)?;
         let config = Arc::new(config);
-        self.cache.insert(hostname.to_string(), Arc::clone(&config));
+
+        {
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            cache.put(hostname.to_string(), Arc::clone(&config));
+        }
 
         Ok(config)
     }
 
     fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
-        let ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
-        let ca_data = ca_data.as_ref().ok_or_else(|| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?;
-        
+        let ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+        let ca_data = ca_data_guard
+            .as_ref()
+            .ok_or_else(|| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?;
+
         let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
         let mut server_params = CertificateParams::default();
@@ -108,7 +118,8 @@ impl CertificateAuthority {
         server_params.not_before = now;
         server_params.not_after = now + Duration::from_secs(24 * 60 * 60 * 30);
 
-        let server_cert = server_params.signed_by(&server_key, &ca_data.ca_cert, &ca_data.ca_key)?;
+        let server_cert =
+            server_params.signed_by(&server_key, &ca_data.ca_cert, &ca_data.ca_key)?;
 
         let cert_der = CertificateDer::from(server_cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
