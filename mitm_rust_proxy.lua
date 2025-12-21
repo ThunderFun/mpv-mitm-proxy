@@ -18,7 +18,7 @@ local proxy_binary = "mpv-mitm-proxy"
 
 local proxies = {}
 local current_proxy_index = 0
-local blocked_proxies = {} -- url -> timestamp
+local blocked_proxies = {}
 local proxy_file = script_dir .. "/proxies.txt"
 local cooldown_file = script_dir .. "/proxy_cooldowns.json"
 
@@ -65,23 +65,16 @@ end
 
 local function get_next_proxy()
     if #proxies == 0 then return nil end
-    
     local now = os.time()
     local cooldown_sec = opts.cooldown_hours * 3600
-    
     for i = 1, #proxies do
         current_proxy_index = (current_proxy_index % #proxies) + 1
         local url = proxies[current_proxy_index]
-        
-        -- Rotation enabled usually means respect cooldowns
-        -- If we want to disable cooldowns but keep rotation, that's different.
-        -- But based on user feedback, "proxy_rotation_enabled" should control the loop.
         if not blocked_proxies[url] or (now - blocked_proxies[url] >= cooldown_sec) then
             blocked_proxies[url] = nil
             return url
         end
     end
-    
     return nil
 end
 
@@ -135,11 +128,9 @@ local function apply_proxy_settings()
         mp.set_property("file-local-options/ytdl-raw-options", "")
         return
     end
-
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
     mp.set_property("file-local-options/tls-verify", "no")
-    
     mp.set_property("file-local-options/ytdl-raw-options",
         "proxy=" .. px .. "," ..
         "force-ipv4=," ..
@@ -151,22 +142,18 @@ local start_proxy_background
 local function is_ytdl_applicable()
     local path = mp.get_property("path")
     if not path then return false end
-    
     if not (path:find("://") or path:find("^[a-zA-Z0-9.-]+:[0-9]+")) then
         return false
     end
-
     if mp.get_property_native("ytdl") == false then
         return false
     end
-
     local non_ytdl_protos = {"rtsp://", "rtmp://", "mms://", "dvb://"}
     for _, proto in ipairs(non_ytdl_protos) do
         if path:lower():find(proto, 1, true) == 1 then
             return false
         end
     end
-
     return true
 end
 
@@ -174,7 +161,6 @@ local function on_load_hook()
     if not is_ytdl_applicable() then
         return
     end
-
     if not proxy_port then
         start_proxy_background()
     end
@@ -184,19 +170,15 @@ local function on_start_file()
     if not is_ytdl_applicable() then
         return
     end
-
     if not proxy_port then
         start_proxy_background()
     end
-
     if proxy_port then
         apply_proxy_settings()
     end
-
     if proxy_ready or not proxy_port then
         return
     end
-
     mp.add_timeout(0.5, function()
         if proxy_ready then return end
         if proxy_port and check_port_open(proxy_port) then
@@ -208,10 +190,8 @@ end
 
 start_proxy_background = function()
     if mitm_job then cleanup() end
-    
     local bin = find_binary()
     if not bin then return end
-    
     local upstream = nil
     if opts.use_proxies then
         upstream = get_next_proxy()
@@ -224,16 +204,13 @@ start_proxy_background = function()
             end
         end
     end
-
     math.randomseed(os.time())
     local port_attempt = math.random(15000, 25000)
-    
     local args = {bin, "--port", tostring(port_attempt)}
     if upstream then
         table.insert(args, "--upstream")
         table.insert(args, upstream)
     end
-
     mitm_job = mp.command_native_async({
         name = "subprocess",
         args = args,
@@ -244,9 +221,7 @@ start_proxy_background = function()
         proxy_ready = false
         mitm_job = nil
     end)
-    
     proxy_port = port_attempt
-    
     mp.add_timeout(0.5, function()
         if proxy_ready then return end
         if proxy_port and check_port_open(port_attempt) then
@@ -257,7 +232,6 @@ start_proxy_background = function()
 end
 
 local function rotate_proxy()
-    -- This handles the actual rotation work
     local blocked_url = proxies[current_proxy_index]
     if blocked_url then
         blocked_proxies[blocked_url] = os.time()
@@ -265,12 +239,9 @@ local function rotate_proxy()
         mp.osd_message("Proxy blocked, rotating...", 3)
         mp.msg.warn("Proxy " .. blocked_url .. " blocked, rotating...")
     end
-    
     cleanup()
-    
     mp.add_timeout(0.2, function()
         start_proxy_background()
-        
         local check_count = 0
         local function wait_and_reload()
             if proxy_ready then
@@ -295,7 +266,6 @@ mp.register_event("shutdown", cleanup)
 mp.enable_messages("warn")
 mp.register_event("log-message", function(e)
     if not opts.use_proxies or not opts.proxy_rotation_enabled then return end
-
     if e.prefix == "ytdl_hook" then
         local msg = e.text:lower()
         if msg:find("sign in to confirm you") and msg:find("not a bot") then
@@ -306,7 +276,6 @@ mp.register_event("log-message", function(e)
 end)
 
 mp.add_hook("on_load_fail", 50, function()
-    -- Generic load fail rotation is disabled as per user request.
 end)
 
 local function show_status()
@@ -319,7 +288,6 @@ end
 
 mp.add_key_binding("P", "proxy-status", show_status)
 
--- Initialization
 load_proxies()
 load_cooldowns()
-save_cooldowns() -- Clean up expired on start
+save_cooldowns()
