@@ -7,6 +7,8 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 - **MITM Proxy**: Re-signs HTTPS traffic on the fly using an ephemeral internal CA.
 - **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments.
 - **Optional Upstream Support**: Can connect to an upstream SOCKS5 proxy if needed.
+- **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
+- **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
 - **mpv Integration**: Includes a Lua script for seamless integration with the mpv media player.
 - **Performance**: Built with Rust and Tokio for high performance and low resource usage.
 
@@ -14,16 +16,11 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 
 - [Rust](https://www.rust-lang.org/) (latest stable)
 - [mpv](https://mpv.io/)
-- (Optional) An upstream **SOCKS5** proxy (Note: HTTP/HTTPS upstream proxies are not supported)
+- (Optional) One or more upstream **SOCKS5** proxies (HTTP/HTTPS upstreams are not supported).
 
 ## Installation
 
 ### 1. Download or Build
-
-#### Download
-Download the latest release for your platform. The package contains:
-- `main.lua` (The mpv script)
-- `mpv-mitm-proxy` (The proxy binary)
 
 #### Build
 If you prefer to build from source:
@@ -38,26 +35,37 @@ Create a new folder named `mpv-mitm-proxy` inside your mpv `scripts` directory:
 - **Linux/macOS**: `~/.config/mpv/scripts/mpv-mitm-proxy/`
 - **Windows**: `%APPDATA%\mpv\scripts\mpv-mitm-proxy\`
 
-Place both the binary (`mpv-mitm-proxy` or `mpv-mitm-proxy.exe`) and the Lua script (`main.lua` or `mitm_rust_proxy.lua`) into that folder.
+Place both the binary (`mpv-mitm-proxy` or `mpv-mitm-proxy.exe`) and the Lua script (`mitm_rust_proxy.lua`) into that folder.
 
-### 3. Configuration (Optional)
+## Configuration
 
-You can modify the upstream proxy settings at the top of the Lua script:
+### Proxy List (`proxies.txt`)
+Create a `proxies.txt` file in the same directory as the script. Add one SOCKS5 proxy URL per line:
+```text
+socks5://127.0.0.1:1080
+socks5://proxy.example.com:1080
+# Lines starting with # are ignored
+```
 
-- **Direct connection (No upstream)**:
-  ```lua
-  local upstream_socks5_url = ""
-  ```
-- **Upstream SOCKS5 proxy**:
-  ```lua
-  local upstream_socks5_url = "socks5://127.0.0.1:1080"
-  ```
+### Script Options
+The script supports several options that can be configured via `script-opts/mitm_rust_proxy.conf` or the command line:
+
+| Option | Default | Description |
+| :--- | :--- | :--- |
+| `use_proxies` | `true` | Enable or disable the use of upstream proxies. |
+| `cooldown_hours` | `16` | How long to block a proxy after a bot challenge. |
+| `fallback_to_direct` | `true` | Use a direct connection if all proxies are blocked. |
+
+Example command line usage:
+```bash
+mpv --script-opts=mitm_rust_proxy-use_proxies=no video_url
+```
 
 ## Usage
 
 The script automatically starts and configures the proxy whenever you open a URL that triggers `yt-dlp` in mpv.
 
-Press `Shift+P` (P) in mpv to check the proxy status.
+- **Check Status**: Press `P` (Shift+p) in mpv to show the current proxy status, port, and upstream.
 
 ## Security
 
