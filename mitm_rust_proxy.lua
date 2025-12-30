@@ -3,10 +3,10 @@ local options = require 'mp.options'
 local utils = require 'mp.utils'
 
 local opts = {
-    use_proxies = false,
+    use_proxies = true,
     proxy_rotation_enabled = true,
     cooldown_hours = 16,
-    fallback_to_direct = true
+    fallback_to_direct = false
 }
 options.read_options(opts, "mitm_rust_proxy")
 
@@ -148,9 +148,20 @@ local function is_ytdl_applicable()
     if mp.get_property_native("ytdl") == false then
         return false
     end
+
+    local lower_path = path:lower()
+    local is_youtube = lower_path:find("youtube%.com") or
+                      lower_path:find("youtu%.be") or
+                      lower_path:find("googlevideo%.com") or
+                      lower_path:find("ytimg%.com")
+    
+    if not is_youtube then
+        return false
+    end
+
     local non_ytdl_protos = {"rtsp://", "rtmp://", "mms://", "dvb://"}
     for _, proto in ipairs(non_ytdl_protos) do
-        if path:lower():find(proto, 1, true) == 1 then
+        if lower_path:find(proto, 1, true) == 1 then
             return false
         end
     end
