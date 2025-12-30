@@ -3,7 +3,7 @@ local options = require 'mp.options'
 local utils = require 'mp.utils'
 
 local opts = {
-    use_proxies = true,
+    use_proxies = false,
     proxy_rotation_enabled = true,
     cooldown_hours = 16,
     fallback_to_direct = false
