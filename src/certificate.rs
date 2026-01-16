@@ -33,18 +33,47 @@ pub struct CertificateAuthority {
 
 impl CertificateAuthority {
     pub fn new() -> Result<Self, CertError> {
+
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "MPV MITM Proxy CA");
+        dn.push(DnType::OrganizationName, "MPV Proxy");
+        ca_params.distinguished_name = dn;
+
+        let now = OffsetDateTime::now_utc();
+        ca_params.not_before = now;
+        ca_params.not_after = now + Duration::from_secs(365 * 24 * 60 * 60 * 10);
+
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+
         Ok(Self {
-            ca_data: Mutex::new(None),
+            ca_data: Mutex::new(Some(CaData { ca_cert, ca_key })),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
         })
     }
 
     fn ensure_initialized(&self) -> Result<(), CertError> {
-        let mut ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+        {
+            let ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+            if ca_data.is_some() {
+                return Ok(());
+            }
+        }
 
+        let mut ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
         if ca_data.is_some() {
             return Ok(());
         }
+
 
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
@@ -112,7 +141,11 @@ impl CertificateAuthority {
         dn.push(DnType::CommonName, hostname);
         server_params.distinguished_name = dn;
 
-        server_params.subject_alt_names = vec![SanType::DnsName(hostname.try_into().unwrap())];
+        server_params.subject_alt_names = vec![SanType::DnsName(
+            hostname
+                .try_into()
+                .map_err(|_| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?,
+        )];
 
         let now = OffsetDateTime::now_utc();
         server_params.not_before = now;
