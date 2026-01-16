@@ -11,11 +11,9 @@ use crate::proxy::ProxyConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Install the ring crypto provider for rustls BEFORE any TLS operations
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
-
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -33,9 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("UPSTREAM_PROXY").ok())
         .filter(|s| !s.is_empty());
 
+    let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
 
     let ca = Arc::new(CertificateAuthority::new()?);
-    let config = Arc::new(ProxyConfig::new(upstream_proxy, ca));
+    let config = Arc::new(ProxyConfig::new(upstream_proxy, ca, direct_cdn));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let listener = TcpListener::bind(addr).await?;
