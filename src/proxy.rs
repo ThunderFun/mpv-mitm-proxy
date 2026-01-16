@@ -11,14 +11,13 @@ use hyper_util::rt::TokioIo;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::borrow::Cow;
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_socks::tcp::Socks5Stream;
@@ -29,6 +28,8 @@ use crate::certificate::CertificateAuthority;
 const CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
 const CONNECTION_POOL_SIZE: usize = 100;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
+const DNS_CACHE_SIZE: usize = 256;
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -119,7 +120,7 @@ impl ConnectionPool {
             }
             
             if state.1 >= CONNECTION_POOL_SIZE {
-                return; // Still over limit? Drop this connection
+                return;
             }
             
             state.1 += 1;
@@ -220,35 +221,93 @@ impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {}
 }
 
+// DNS cache entry with TTL
+struct DnsCacheEntry {
+    addrs: Vec<IpAddr>,
+    expires_at: Instant,
+}
+
+struct DnsCache {
+    cache: Mutex<LruCache<String, DnsCacheEntry>>,
+}
+
+impl DnsCache {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(DNS_CACHE_SIZE).unwrap(),
+            )),
+        }
+    }
+
+    fn get(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let mut cache = self.cache.lock();
+        if let Some(entry) = cache.get(host) {
+            if entry.expires_at > Instant::now() {
+                return Some(entry.addrs.clone());
+            }
+
+            cache.pop(host);
+        }
+        None
+    }
+
+    fn put(&self, host: String, addrs: Vec<IpAddr>) {
+        let entry = DnsCacheEntry {
+            addrs,
+            expires_at: Instant::now() + DNS_CACHE_TTL,
+        };
+        self.cache.lock().put(host, entry);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProxyType {
+    Socks5,
+    Http,
+}
+
 pub struct ProxyConfig {
     upstream_proxy: Option<UpstreamProxy>,
     pub ca: Arc<CertificateAuthority>,
     tls_client_config: Arc<rustls::ClientConfig>,
     connection_pool: Arc<ConnectionPool>,
+    dns_cache: Arc<DnsCache>,
     client_http1_builder: hyper::client::conn::http1::Builder,
     server_http1_builder: hyper::server::conn::http1::Builder,
+    direct_cdn: bool,
 }
 
 struct UpstreamProxy {
-    addr: SocketAddr,
+    proxy_type: ProxyType,
+    host: String,
+    port: u16,
     username: Option<String>,
     password: Option<String>,
 }
 
 impl ProxyConfig {
-    pub fn new(upstream_url: Option<String>, ca: Arc<CertificateAuthority>) -> Self {
+    pub fn new(upstream_url: Option<String>, ca: Arc<CertificateAuthority>, direct_cdn: bool) -> Self {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
-            let host = url.host_str()?;
-            let port = url.port().unwrap_or(1080);
+            let scheme = url.scheme();
+            let proxy_type = match scheme {
+                "socks5" | "socks5h" => ProxyType::Socks5,
+                "http" | "https" => ProxyType::Http,
+                _ => return None,
+            };
+            let host = url.host_str()?.to_string();
+            let port = url.port().unwrap_or(match proxy_type {
+                ProxyType::Socks5 => 1080,
+                ProxyType::Http => 8080,
+            });
             let username = (!url.username().is_empty()).then(|| url.username().to_string());
             let password = url.password().map(ToString::to_string);
 
-            let mut addrs = (host, port).to_socket_addrs().ok()?;
-            let addr = addrs.next()?;
-
             Some(UpstreamProxy {
-                addr,
+                proxy_type,
+                host,
+                port,
                 username,
                 password,
             })
@@ -262,6 +321,7 @@ impl ProxyConfig {
         );
 
         let connection_pool = Arc::new(ConnectionPool::new());
+        let dns_cache = Arc::new(DnsCache::new());
 
         let mut client_http1_builder = hyper::client::conn::http1::Builder::new();
         client_http1_builder.preserve_header_case(true);
@@ -285,33 +345,123 @@ impl ProxyConfig {
             ca,
             tls_client_config,
             connection_pool,
+            dns_cache,
             client_http1_builder,
             server_http1_builder,
+            direct_cdn,
         }
+    }
+
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr, ProxyError> {
+        if let Some(addrs) = self.dns_cache.get(host) {
+            if let Some(ip) = addrs.first() {
+                return Ok(SocketAddr::new(*ip, port));
+            }
+        }
+
+
+        let host_owned = host.to_string();
+        let addrs: Vec<IpAddr> = tokio::task::spawn_blocking(move || {
+            (host_owned.as_str(), 0u16)
+                .to_socket_addrs()
+                .map(|iter| iter.map(|addr| addr.ip()).collect())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if addrs.is_empty() {
+            return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("DNS resolution failed for {}", host),
+            )));
+        }
+
+        // Cache the result
+        let ip = addrs[0];
+        self.dns_cache.put(host.to_string(), addrs);
+        Ok(SocketAddr::new(ip, port))
     }
 
     #[inline]
     async fn connect(&self, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
         let connect_fut = async {
+
+            let use_direct = self.direct_cdn && host.ends_with("googlevideo.com");
+            
             match &self.upstream_proxy {
-                Some(proxy) => {
-                    let stream = match (&proxy.username, &proxy.password) {
-                        (Some(user), Some(pass)) => {
-                            Socks5Stream::connect_with_password(
-                                proxy.addr,
-                                (host, port),
-                                user,
-                                pass,
-                            )
-                            .await?
+                Some(proxy) if !use_direct => {
+
+                    let proxy_addr = self.resolve_host(&proxy.host, proxy.port).await?;
+                    
+                    match proxy.proxy_type {
+                        ProxyType::Socks5 => {
+
+                            let stream = match (&proxy.username, &proxy.password) {
+                                (Some(user), Some(pass)) => {
+                                    Socks5Stream::connect_with_password(
+                                        proxy_addr,
+                                        (host, port),
+                                        user,
+                                        pass,
+                                    )
+                                    .await?
+                                }
+                                _ => {
+                                    Socks5Stream::connect(proxy_addr, (host, port)).await?
+                                }
+                            };
+                            let tcp_stream = stream.into_inner();
+                            let _ = tcp_stream.set_nodelay(true);
+                            Ok(tcp_stream)
                         }
-                        _ => {
-                            Socks5Stream::connect(proxy.addr, (host, port)).await?
+                        ProxyType::Http => {
+
+                            let mut tcp_stream = TcpStream::connect(proxy_addr).await?;
+                            let _ = tcp_stream.set_nodelay(true);
+                            
+
+                            let connect_req = if let (Some(user), Some(pass)) = (&proxy.username, &proxy.password) {
+                                use base64::Engine;
+                                let credentials = base64::engine::general_purpose::STANDARD
+                                    .encode(format!("{}:{}", user, pass));
+                                format!(
+                                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Authorization: Basic {}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+                                    host, port, host, port, credentials
+                                )
+                            } else {
+                                format!(
+                                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+                                    host, port, host, port
+                                )
+                            };
+                            
+                            tcp_stream.write_all(connect_req.as_bytes()).await?;
+                            
+
+                            let mut buf = [0u8; 1024];
+                            let n = tcp_stream.read(&mut buf).await?;
+                            let response = String::from_utf8_lossy(&buf[..n]);
+                            
+
+                            if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+                                return Err(ProxyError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    format!("HTTP proxy CONNECT failed: {}", response.lines().next().unwrap_or("")),
+                                )));
+                            }
+                            
+                            Ok(tcp_stream)
                         }
-                    };
-                    Ok(stream.into_inner())
+                    }
                 }
-                None => Ok(TcpStream::connect((host, port)).await?),
+                _ => {
+
+                    let addr = self.resolve_host(host, port).await?;
+                    let tcp_stream = TcpStream::connect(addr).await?;
+                    let _ = tcp_stream.set_nodelay(true);
+                    Ok(tcp_stream)
+                }
             }
         };
 
@@ -339,7 +489,7 @@ impl ProxyConfig {
             }
         }
 
-        // Create new connection
+
         let upstream_tcp = self.connect(host_str, port).await?;
 
         if is_tls {
@@ -616,7 +766,7 @@ async fn forward_request(
 
     let (mut parts, body) = req.into_parts();
 
-    // Set URI and Host header
+
     if is_tls {
         let path_and_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
         parts.uri = Uri::builder()
@@ -634,7 +784,7 @@ async fn forward_request(
 
     let (parts, incoming_body) = resp.into_parts();
 
-    // Check if connection can be reused
+
     let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
         && parts.headers
             .get(header::CONNECTION)
