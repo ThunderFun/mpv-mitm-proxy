@@ -131,7 +131,6 @@ local function apply_proxy_settings()
     end
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
-    mp.set_property("file-local-options/tls-verify", "no")
     mp.set_property("file-local-options/ytdl-raw-options",
         "proxy=" .. px .. "," ..
         "force-ipv4=," ..
@@ -191,13 +190,20 @@ local function on_start_file()
     if proxy_ready or not proxy_port then
         return
     end
-    mp.add_timeout(0.5, function()
+    
+    local check_count = 0
+    local function wait_ready()
         if proxy_ready then return end
         if proxy_port and check_port_open(proxy_port) then
             proxy_ready = true
             mp.msg.info("Proxy ready on port " .. proxy_port)
+            apply_proxy_settings()
+        elseif check_count < 20 then
+            check_count = check_count + 1
+            mp.add_timeout(0.1, wait_ready)
         end
-    end)
+    end
+    wait_ready()
 end
 
 start_proxy_background = function()
@@ -238,13 +244,20 @@ start_proxy_background = function()
         mitm_job = nil
     end)
     proxy_port = port_attempt
-    mp.add_timeout(0.5, function()
+    
+    local check_count = 0
+    local function wait_ready()
         if proxy_ready then return end
-        if proxy_port and check_port_open(port_attempt) then
+        if check_port_open(port_attempt) then
             proxy_ready = true
-            mp.msg.info("Proxy ready on port " .. proxy_port)
+            mp.msg.info("Proxy ready on port " .. port_attempt)
+            apply_proxy_settings()
+        elseif check_count < 20 then
+            check_count = check_count + 1
+            mp.add_timeout(0.1, wait_ready)
         end
-    end)
+    end
+    wait_ready()
 end
 
 local function rotate_proxy()
