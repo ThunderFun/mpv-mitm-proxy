@@ -3,10 +3,11 @@ local options = require 'mp.options'
 local utils = require 'mp.utils'
 
 local opts = {
-    use_proxies = false,
+    use_proxies = true,
     proxy_rotation_enabled = true,
     cooldown_hours = 16,
-    fallback_to_direct = false
+    fallback_to_direct = false,
+    direct_cdn = false
 }
 options.read_options(opts, "mitm_rust_proxy")
 
@@ -221,6 +222,10 @@ start_proxy_background = function()
     if upstream then
         table.insert(args, "--upstream")
         table.insert(args, upstream)
+    end
+
+    if opts.direct_cdn then
+        table.insert(args, "--direct-cdn")
     end
     mitm_job = mp.command_native_async({
         name = "subprocess",
