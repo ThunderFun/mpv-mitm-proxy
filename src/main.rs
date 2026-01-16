@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
 
     let ca = Arc::new(CertificateAuthority::new()?);
-    let config = Arc::new(ProxyConfig::new(upstream_proxy, ca, direct_cdn));
+    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let listener = TcpListener::bind(addr).await?;
