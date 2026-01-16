@@ -6,7 +6,7 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 
 - **MITM Proxy**: Re-signs HTTPS traffic on the fly using an ephemeral internal CA.
 - **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments.
-- **Optional Upstream Support**: Can connect to an upstream SOCKS5 proxy if needed.
+- **Optional Upstream Support**: Can connect to an upstream HTTP/HTTPS/SOCKS5 proxy if needed.
 - **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
 - **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
 - **mpv Integration**: Includes a Lua script for seamless integration with the mpv media player.
@@ -16,7 +16,7 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 
 - [Rust](https://www.rust-lang.org/) (latest stable)
 - [mpv](https://mpv.io/)
-- (Optional) One or more upstream **SOCKS5** proxies (HTTP/HTTPS upstreams are not supported).
+- (Optional) One or more upstream proxies
 
 ## Installation
 
