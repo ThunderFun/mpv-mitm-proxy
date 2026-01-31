@@ -1,0 +1,48 @@
+name: Linux Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build
+      run: cargo build --release --target x86_64-unknown-linux-gnu
+
+    - name: Prepare artifact with folder structure
+      shell: bash
+      run: |
+        mkdir -p dist/mpv-mitm-proxy
+        cp mitm_rust_proxy.lua dist/mpv-mitm-proxy/main.lua
+        cp proxies.txt dist/mpv-mitm-proxy/proxies.txt
+        cp target/x86_64-unknown-linux-gnu/release/mpv-mitm-proxy dist/mpv-mitm-proxy/mpv-mitm-proxy
+        chmod +x dist/mpv-mitm-proxy/mpv-mitm-proxy
+
+    - name: Create archive
+      shell: bash
+      run: |
+        mkdir -p assets
+        cd dist
+        tar -czf ../assets/mpv-mitm-proxy-linux.tar.gz .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mpv-mitm-proxy-linux
+        path: assets/*

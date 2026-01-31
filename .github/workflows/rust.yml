@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -29,10 +29,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: mpv-mitm-proxy-linux
             asset_name: mpv-mitm-proxy-linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact_name: mpv-mitm-proxy-linux-static
-            asset_name: mpv-mitm-proxy-linux-static
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: mpv-mitm-proxy-windows
@@ -50,36 +46,30 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
-    - name: Install dependencies (Linux MUSL)
-      if: matrix.target == 'x86_64-unknown-linux-musl'
-      run: sudo apt-get update && sudo apt-get install -y musl-tools
-
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
     - name: Build
       run: cargo build --release --target ${{ matrix.target }}
-      env:
-        RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '-C target-feature=+crt-static' || '' }}
 
     - name: Prepare artifact
       shell: bash
       run: |
-        mkdir -p dist
-        cp mitm_rust_proxy.lua dist/main.lua
-        cp proxies.txt dist/proxies.txt
+        mkdir -p dist/mpv-mitm-proxy
+        cp mitm_rust_proxy.lua dist/mpv-mitm-proxy/main.lua
+        cp proxies.txt dist/mpv-mitm-proxy/proxies.txt
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
-          cp target/${{ matrix.target }}/release/mpv-mitm-proxy.exe dist/mpv-mitm-proxy.exe
+          cp target/${{ matrix.target }}/release/mpv-mitm-proxy.exe dist/mpv-mitm-proxy/mpv-mitm-proxy.exe
         else
-          cp target/${{ matrix.target }}/release/mpv-mitm-proxy dist/mpv-mitm-proxy
-          chmod +x dist/mpv-mitm-proxy
+          cp target/${{ matrix.target }}/release/mpv-mitm-proxy dist/mpv-mitm-proxy/mpv-mitm-proxy
+          chmod +x dist/mpv-mitm-proxy/mpv-mitm-proxy
         fi
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: dist/*
+        path: dist/mpv-mitm-proxy/*
 
   release:
     name: Create Release
@@ -102,19 +92,19 @@ jobs:
           for dir in artifacts/*; do
             platform=$(basename "$dir")
             echo "Packaging $platform..."
-            mkdir -p "pkg/$platform/mpv-mitm-proxy"
-            cp "$dir"/* "pkg/$platform/mpv-mitm-proxy/"
-
+            mkdir -p "pkg/$platform"
+            cp -r "$dir"/* "pkg/$platform/"
+            
             # Restore executable permissions for non-Windows binaries
             # (permissions are lost when artifacts are uploaded/downloaded)
             if [[ "$platform" != *"windows"* ]]; then
               chmod +x "pkg/$platform/mpv-mitm-proxy/mpv-mitm-proxy"
             fi
-
+            
             if [[ "$platform" == *"windows"* ]]; then
-              (cd "pkg/$platform/mpv-mitm-proxy" && zip -r "../../../assets/$platform.zip" .)
+              (cd "pkg/$platform" && zip -r "../../assets/$platform.zip" .)
             else
-              (cd "pkg/$platform/mpv-mitm-proxy" && tar -czf "../../../assets/$platform.tar.gz" .)
+              (cd "pkg/$platform" && tar -czf "../../assets/$platform.tar.gz" .)
             fi
           done
 
