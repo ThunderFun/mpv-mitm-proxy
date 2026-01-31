@@ -5,7 +5,7 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 ## Features
 
 - **MITM Proxy**: Re-signs HTTPS traffic on the fly using an ephemeral internal CA.
-- **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments.
+- **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments. ⚠️ *Note: Chunk modification may no longer be working.*
 - **Optional Upstream Support**: Can connect to an upstream HTTP/HTTPS/SOCKS5 proxy if needed.
 - **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
 - **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
@@ -52,9 +52,13 @@ The script supports several options that can be configured via `script-opts/mitm
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `use_proxies` | `true` | Enable or disable the use of upstream proxies. |
+| `use_proxies` | `false` | Enable or disable the use of upstream proxies. |
 | `cooldown_hours` | `16` | How long to block a proxy after a bot challenge. |
-| `fallback_to_direct` | `true` | Use a direct connection if all proxies are blocked. |
+| `fallback_to_direct` | `false` | Use a direct connection if all proxies are blocked. |
+| `proxy_rotation_enabled` | `false` | Enable proxy rotation when a proxy is blocked. |
+| `direct_cdn` | `false` | Experimental: Use direct connection for CDN connections. |
+| `ytdl_opts_fix` | `true` | Apply a fix for some network errors. |
+| `bypass_chunk_modification` | `false` | Disable chunk modification. |
 
 Example command line usage:
 ```bash
