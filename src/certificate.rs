@@ -45,6 +45,8 @@ pub struct CertificateAuthority {
     cache: Mutex<LruCache<String, Arc<ServerConfig>>>,
     // Inflight map to prevent concurrent certificate generation for same hostname
     inflight: DashMap<String, watch::Receiver<Option<Result<Arc<ServerConfig>, CertError>>>>,
+    // Separate flag for CA initialization to prevent duplicate CA generation
+    ca_init_inflight: Mutex<Option<watch::Receiver<bool>>>,
 }
 
 impl CertificateAuthority {
@@ -75,10 +77,12 @@ impl CertificateAuthority {
             ca_data: Mutex::new(Some(CaData { ca_cert, ca_key })),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
             inflight: DashMap::new(),
+            ca_init_inflight: Mutex::new(None),
         })
     }
 
     async fn ensure_initialized(&self) -> Result<(), CertError> {
+        // Fast path: check if already initialized
         {
             let ca_data = self.ca_data.lock().await;
             if ca_data.is_some() {
@@ -86,6 +90,52 @@ impl CertificateAuthority {
             }
         }
 
+        // Slow path: need to initialize - use ca_init_inflight to prevent duplicate work
+        let mut ca_init_guard = self.ca_init_inflight.lock().await;
+        
+        if let Some(rx) = ca_init_guard.as_ref() {
+            // Another task is initializing, wait for it
+            let mut rx = rx.clone();
+            drop(ca_init_guard);
+            loop {
+                if *rx.borrow() {
+                    // Initialization complete (success or failure)
+                    let ca_data = self.ca_data.lock().await;
+                    return if ca_data.is_some() {
+                        Ok(())
+                    } else {
+                        Err(CertError::Generation("CA initialization failed".to_string()))
+                    };
+                }
+                if rx.changed().await.is_err() {
+                    return Err(CertError::Lock);
+                }
+            }
+        }
+
+        // We are the one to initialize
+        let (tx, rx) = watch::channel(false);
+        *ca_init_guard = Some(rx);
+        drop(ca_init_guard);
+
+        // Double-check under the lock
+        {
+            let ca_data = self.ca_data.lock().await;
+            if ca_data.is_some() {
+                let _ = tx.send(true);
+                *self.ca_init_inflight.lock().await = None;
+                return Ok(());
+            }
+        }
+
+        // Perform initialization
+        let result = self.do_initialize().await;
+        let _ = tx.send(true);
+        *self.ca_init_inflight.lock().await = None;
+        result
+    }
+    
+    async fn do_initialize(&self) -> Result<(), CertError> {
         let mut ca_data = self.ca_data.lock().await;
         if ca_data.is_some() {
             return Ok(());

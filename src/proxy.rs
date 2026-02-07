@@ -59,7 +59,9 @@ struct PooledConnection {
 
 impl PooledConnection {
     fn is_valid(&self) -> bool {
-        self.created_at.elapsed() < CONNECTION_TTL && self.sender.is_some()
+        self.created_at.elapsed() < CONNECTION_TTL
+            && self.sender.is_some()
+            && !self.abort_handle.is_finished()
     }
     
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
@@ -140,40 +142,36 @@ impl ConnectionPool {
     fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
         let key = ConnKey { host, port, is_tls };
         
-        let mut current = self.connection_count.load(Ordering::SeqCst);
-        loop {
-            if current >= CONNECTION_POOL_SIZE {
-                // Pool is full, abort the connection
-                abort_handle.abort();
-                return;
-            }
-            match self.connection_count.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
+        // First, acquire the state lock to check capacity and potentially evict
+        let mut state = self.state.lock();
+        
+        // Evict LRU entries if at capacity (under lock to ensure atomicity)
+        if state.1 >= CONNECTION_POOL_SIZE {
+            if let Some((old_key, _)) = state.0.pop_lru() {
+                if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
+                    let removed_count = conns_mutex.lock().len();
+                    state.1 = state.1.saturating_sub(removed_count);
+                    self.connection_count.fetch_sub(removed_count, Ordering::SeqCst);
+                }
             }
         }
         
-        {
-            let mut state = self.state.lock();
-            // Also maintain the LRU cache within the state mutex
-            if state.1 >= CONNECTION_POOL_SIZE {
-                if let Some((old_key, _)) = state.0.pop_lru() {
-                    if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
-                        let removed_count = conns_mutex.lock().len();
-                        state.1 = state.1.saturating_sub(removed_count);
-                        self.connection_count.fetch_sub(removed_count, Ordering::SeqCst);
-                    }
-                }
-            }
-            
-            state.1 += 1;
-            state.0.put(key.clone(), ());
+        // Check if we still have room after eviction
+        let current_count = self.connection_count.load(Ordering::SeqCst);
+        if current_count >= CONNECTION_POOL_SIZE {
+            // Still at capacity, abort the new connection
+            drop(state); // Release lock before abort
+            abort_handle.abort();
+            return;
         }
+        
+        // Increment counter and add to pool atomically under the lock
+        self.connection_count.fetch_add(1, Ordering::SeqCst);
+        state.1 += 1;
+        state.0.put(key.clone(), ());
+        
+        // Release state lock before acquiring DashMap entry lock
+        drop(state);
 
         let entry = self.pool.entry(key).or_insert_with(|| Mutex::new(Vec::with_capacity(4)));
         entry.value().lock().push(PooledConnection {
@@ -234,6 +232,18 @@ impl BodyWithPoolReturn {
         if let (Some(sender), Some((host, port, is_tls)), Some(abort_handle)) =
             (self.sender.take(), self.host_port_tls.take(), self.abort_handle.take())
         {
+            // Don't return to pool if the connection task has finished
+            if abort_handle.is_finished() {
+                return;
+            }
+            
+            // Check if sender is still usable before returning to pool
+            // If sender is closed, don't pool the connection
+            if sender.is_closed() {
+                abort_handle.abort();
+                return;
+            }
+            
             self.pool.put(host, port, is_tls, sender, abort_handle);
         }
     }
@@ -315,9 +325,16 @@ impl DnsCache {
             } else if now < entry.stale_at {
                 return (Some(entry.result.clone()), true);
             }
+            // Entry is fully expired, remove it
             cache.pop(host);
         }
         (None, false)
+    }
+    
+    /// Remove a stale entry from the cache to force a fresh lookup
+    fn remove(&self, host: &str) {
+        let mut cache = self.cache.lock();
+        cache.pop(host);
     }
 
     fn put(&self, host: String, result: Result<Vec<IpAddr>, String>) {
@@ -416,13 +433,15 @@ impl ProxyConfig {
         server_http1_builder.title_case_headers(true);
 
         let pool_clone = Arc::clone(&connection_pool);
-        tokio::spawn(async move {
+        let cleanup_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 pool_clone.cleanup();
             }
         });
+        // Store handle for potential graceful shutdown (currently runs until process exit)
+        let _ = cleanup_handle;
 
         let config = Arc::new(Self {
             upstream_proxy,
@@ -460,7 +479,11 @@ impl ProxyConfig {
                 tokio::spawn(async move {
                     // perform_dns_lookup uses DashMap entry API to ensure only one
                     // lookup task is spawned per hostname
-                    let _ = self_clone.perform_dns_lookup(host_owned).await;
+                    let result = self_clone.perform_dns_lookup(host_owned.clone()).await;
+                    // If refresh failed, remove the stale entry to force fresh lookup next time
+                    if result.is_err() {
+                        self_clone.dns_cache.remove(&host_owned);
+                    }
                 });
             }
             return match result {
@@ -485,6 +508,11 @@ impl ProxyConfig {
                 let host_clone = host.clone();
                 let dns_cache = Arc::clone(&self.dns_cache);
                 tokio::spawn(async move {
+                    // Use a scope guard to ensure inflight entry is always cleaned up
+                    let _cleanup = scopeguard::guard((dns_cache.clone(), host_clone.clone()), |(dc, h)| {
+                        dc.inflight.remove(&h);
+                    });
+                    
                     let host_for_lookup = host_clone.clone();
                     let res: Result<Vec<IpAddr>, String> = tokio::task::spawn_blocking(move || {
                         (host_for_lookup.as_str(), 0u16)
@@ -503,9 +531,9 @@ impl ProxyConfig {
                     .unwrap_or_else(|e| Err(e.to_string()));
 
                     dns_cache.put(host_clone.clone(), res.clone());
-                    // Always remove inflight entry, even if all receivers dropped
+                    // Send result before cleanup guard drops
                     let _ = tx.send(Some(res));
-                    dns_cache.inflight.remove(&host_clone);
+                    // Cleanup guard will remove inflight entry here
                 });
                 rx
             }
@@ -602,8 +630,7 @@ impl ProxyConfig {
 
                             let mut buf = [0u8; 1024];
                             let mut pos = 0;
-                            #[allow(unused_assignments)]
-                            let mut header_end = 0;
+                            let header_end;
                             
                             loop {
                                 let n = tcp_stream.read(&mut buf[pos..]).await?;
@@ -629,14 +656,6 @@ impl ProxyConfig {
                                 }
                             }
 
-                            // Ensure we found valid headers before checking
-                            if header_end == 0 {
-                                return Err(ProxyError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "HTTP proxy response missing headers",
-                                )));
-                            }
-
                             // Check response status using only the header portion
                             if !buf[..header_end].starts_with(b"HTTP/1.1 200") && !buf[..header_end].starts_with(b"HTTP/1.0 200") {
                                 let first_line = buf[..header_end].split(|&b| b == b'\n').next().unwrap_or(&[]);
@@ -646,9 +665,9 @@ impl ProxyConfig {
                                 )));
                             }
                             
-                            // Note - any data after headers (buf[header_end..pos]) 
-                            // would typically be the start of TLS handshake from the upstream.
-                            // This is expected behavior for CONNECT tunneling.
+                            // Note: Any data after headers (buf[header_end..pos]) would typically be
+                            // the start of TLS handshake from upstream. The TLS connector will read
+                            // this data directly from the stream's internal buffer.
                             
                             Ok(tcp_stream)
                         }
@@ -680,16 +699,35 @@ impl ProxyConfig {
         port: u16,
         is_tls: bool,
     ) -> Result<(SendRequest<Incoming>, AbortHandle), ProxyError> {
-        while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
-            match sender.ready().await {
-                Ok(_) => return Ok((sender, abort_handle)),
-                Err(_) => {
-                    abort_handle.abort();
-                    continue;
+        // Retry loop for pooled connections - but limit retries to avoid infinite loops
+        let mut attempts = 0;
+        const MAX_POOL_ATTEMPTS: u32 = 3;
+        
+        while attempts < MAX_POOL_ATTEMPTS {
+            if let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
+                attempts += 1;
+                
+                // Check if connection is still usable with a timeout
+                // ready() can hang if the connection is in a bad state
+                match tokio::time::timeout(Duration::from_millis(100), sender.ready()).await {
+                    Ok(Ok(_)) => {
+                        // Additional check: verify the connection task is still running
+                        if abort_handle.is_finished() {
+                            // Connection task has finished - connection is dead
+                            continue;
+                        }
+                        return Ok((sender, abort_handle));
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // Connection is broken or timed out, abort and try next
+                        abort_handle.abort();
+                        continue;
+                    }
                 }
+            } else {
+                break; // No more pooled connections available
             }
         }
-
 
         let upstream_tcp = self.connect(host_str, port).await?;
 
@@ -845,17 +883,22 @@ fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
     if let Some(authority) = uri.authority() {
         let auth_str = authority.as_str();
         if auth_str.starts_with('[') {
-            if let Some(end_bracket) = auth_str.find(']') {
-                // Keep brackets for IPv6 addresses (required for Host header and SNI)
-                let host = &auth_str[..=end_bracket];
-                let rest = &auth_str[end_bracket + 1..];
-                if rest.starts_with(':') {
-                    if let Ok(port) = rest[1..].parse::<u16>() {
-                        return Ok((host.to_string(), port));
-                    }
+            // IPv6 address - must have closing bracket
+            let end_bracket = auth_str.find(']').ok_or_else(|| {
+                ProxyError::InvalidUri(Cow::Owned(format!(
+                    "Invalid IPv6 address, missing closing bracket: {}",
+                    uri
+                )))
+            })?;
+            // Keep brackets for IPv6 addresses (required for Host header and SNI)
+            let host = &auth_str[..=end_bracket];
+            let rest = &auth_str[end_bracket + 1..];
+            if rest.starts_with(':') {
+                if let Ok(port) = rest[1..].parse::<u16>() {
+                    return Ok((host.to_string(), port));
                 }
-                return Ok((host.to_string(), 443));
             }
+            return Ok((host.to_string(), 443));
         }
 
         if let Some(idx) = auth_str.rfind(':') {
@@ -989,7 +1032,13 @@ fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
         };
     }
 
-    let new_end_byte = start_byte.saturating_add(CHUNK_SIZE - 1);
+    // Check for potential overflow before calculating new end byte
+    let new_end_byte = if start_byte > u64::MAX - CHUNK_SIZE + 1 {
+        // Would overflow, use max value
+        u64::MAX
+    } else {
+        start_byte + CHUNK_SIZE - 1
+    };
 
     let mut buf = Vec::with_capacity(48);
     buf.extend_from_slice(b"bytes=");
@@ -1037,7 +1086,7 @@ async fn forward_request(
     } else {
         http::HeaderValue::from_maybe_shared(format!("{}:{}", host, port))
     }
-    .expect("valid host header");
+    .map_err(|_| ProxyError::InvalidUri(Cow::Owned(format!("Invalid host header: {}:{}", host, port))))?;
 
     let (mut parts, body) = req.into_parts();
 
@@ -1058,6 +1107,8 @@ async fn forward_request(
     let resp = match sender.send_request(req).await {
         Ok(resp) => resp,
         Err(e) => {
+            // Abort the connection - body doesn't need to be consumed
+            // as the connection is being torn down anyway
             abort_handle.abort();
             return Err(e.into());
         }
@@ -1067,6 +1118,7 @@ async fn forward_request(
 
 
     let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
+        && !sender.is_closed()
         && parts.headers
             .get(header::CONNECTION)
             .map(|v| !v.as_bytes().eq_ignore_ascii_case(b"close"))
