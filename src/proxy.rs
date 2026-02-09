@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use http::{header, Method, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame};
+use socket2::{Socket, TcpKeepalive};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
@@ -27,7 +28,19 @@ use url::Url;
 
 use crate::certificate::CertificateAuthority;
 
-const CHUNK_SIZE: u64 = 10 * 1024 * 1024; 
+fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    let sock = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    sock.set_tcp_keepalive(&ka)?;
+    // Prevent socket from being closed when sock is dropped
+    let _ = sock.into_raw_fd();
+    Ok(())
+}
+
+const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 const CONNECTION_POOL_SIZE: usize = 100;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
 const DNS_CACHE_SIZE: usize = 256;
@@ -58,8 +71,13 @@ struct PooledConnection {
 }
 
 impl PooledConnection {
-    fn is_valid(&self) -> bool {
-        self.created_at.elapsed() < CONNECTION_TTL
+    fn is_valid(&self, upstream_proxy: bool) -> bool {
+        let ttl = if upstream_proxy {
+            Duration::from_secs(10)
+        } else {
+            CONNECTION_TTL
+        };
+        self.created_at.elapsed() < ttl
             && self.sender.is_some()
             && self.abort_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
     }
@@ -104,12 +122,12 @@ impl ConnectionPool {
         }
     }
 
-    fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
+    fn get(&self, host: &str, port: u16, is_tls: bool, upstream_proxy: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
         let key = ConnKey { host: host.to_string(), port, is_tls };
         if let Some(entry) = self.pool.get(&key) {
             let mut conns = entry.value().lock();
             while let Some(conn) = conns.pop() {
-                if conn.is_valid() {
+                if conn.is_valid(upstream_proxy) {
                     if let Some(pair) = conn.take() {
                         self.total.fetch_sub(1, Ordering::SeqCst);
                         let mut state = self.state.lock();
@@ -153,7 +171,7 @@ impl ConnectionPool {
         self.pool.retain(|_, conns_mutex| {
             let mut conns = conns_mutex.lock();
             let before = conns.len();
-            conns.retain(|c| c.is_valid());
+            conns.retain(|c| c.is_valid(false));
             let after = conns.len();
             removed += before - after;
             after != 0
@@ -170,6 +188,7 @@ struct BodyWithPoolReturn {
     host_port_tls: Option<(String, u16, bool)>,
     sender: Option<SendRequest<Incoming>>,
     abort_handle: Option<AbortHandle>,
+    healthy: bool,
 }
 
 impl BodyWithPoolReturn {
@@ -188,25 +207,24 @@ impl BodyWithPoolReturn {
             host_port_tls: Some((host, port, is_tls)),
             sender: Some(sender),
             abort_handle: Some(abort_handle),
+            healthy: true,
         }
     }
 
     fn return_to_pool(&mut self) {
+        if !self.healthy {
+            if let Some(h) = self.abort_handle.take() {
+                h.abort();
+            }
+            return;
+        }
         if let (Some(sender), Some((host, port, is_tls)), Some(abort_handle)) =
             (self.sender.take(), self.host_port_tls.take(), self.abort_handle.take())
         {
-            // Don't return to pool if the connection task has finished
-            if abort_handle.is_finished() {
-                return;
-            }
-            
-            // Check if sender is still usable before returning to pool
-            // If sender is closed, don't pool the connection
-            if sender.is_closed() {
+            if abort_handle.is_finished() || sender.is_closed() {
                 abort_handle.abort();
                 return;
             }
-            
             self.pool.put(host, port, is_tls, sender, abort_handle);
         }
     }
@@ -227,6 +245,7 @@ impl Body for BodyWithPoolReturn {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
+                self.healthy = false;
                 self.sender.take();
                 if let Some(handle) = self.abort_handle.take() {
                     handle.abort();
@@ -248,8 +267,7 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        // Only abort if the connection wasn't returned to pool
-        // (sender is None means it was returned)
+        // Abort only if connection wasn't returned to pool (sender is None)
         if self.sender.is_some() {
             if let Some(handle) = self.abort_handle.take() {
                 handle.abort();
@@ -462,7 +480,7 @@ impl ProxyConfig {
                 pool_clone.cleanup();
             }
         });
-        // Store handle for potential graceful shutdown (currently runs until process exit)
+        // Cleanup task runs until process exit
         let _ = cleanup_handle;
 
         let config = Arc::new(Self {
@@ -494,15 +512,11 @@ impl ProxyConfig {
         
         if let Some(result) = cached {
             if is_stale {
-                // Use perform_dns_lookup which has proper inflight coordination
-                // This prevents multiple concurrent stale refreshes for the same hostname
+                // Spawn background refresh for stale entries
                 let self_clone = Arc::clone(self);
                 let host_owned = host.to_string();
                 tokio::spawn(async move {
-                    // perform_dns_lookup uses DashMap entry API to ensure only one
-                    // lookup task is spawned per hostname
                     let result = self_clone.perform_dns_lookup(host_owned.clone()).await;
-                    // If refresh failed, remove the stale entry to force fresh lookup next time
                     if result.is_err() {
                         self_clone.dns_cache.remove(&host_owned);
                     }
@@ -530,7 +544,7 @@ impl ProxyConfig {
                 let host_clone = host.clone();
                 let dns_cache = Arc::clone(&self.dns_cache);
                 tokio::spawn(async move {
-                    // Use a scope guard to ensure inflight entry is always cleaned up
+                    // Ensure inflight entry is always cleaned up
                     let _cleanup = scopeguard::guard((dns_cache.clone(), host_clone.clone()), |(dc, h)| {
                         dc.inflight.remove(&h);
                     });
@@ -553,9 +567,7 @@ impl ProxyConfig {
                     .unwrap_or_else(|e| Err(e.to_string()));
 
                     dns_cache.put(host_clone.clone(), res.clone());
-                    // Send result before cleanup guard drops
                     let _ = tx.send(Some(res));
-                    // Cleanup guard will remove inflight entry here
                 });
                 rx
             }
@@ -629,11 +641,13 @@ impl ProxyConfig {
                             };
                             let tcp_stream = stream.into_inner();
                             let _ = tcp_stream.set_nodelay(true);
+                            let _ = set_keepalive(&tcp_stream);
                             Ok(tcp_stream)
                         }
                         ProxyType::Http => {
                             let mut tcp_stream = TcpStream::connect(proxy_addrs.as_slice()).await?;
                             let _ = tcp_stream.set_nodelay(true);
+                            let _ = set_keepalive(&tcp_stream);
 
                             let connect_req = if let (Some(user), Some(pass)) = (&proxy.username, &proxy.password) {
                                 use base64::Engine;
@@ -660,6 +674,7 @@ impl ProxyConfig {
                     let addrs = self_clone.resolve_host(&host_owned, port).await?;
                     let tcp_stream = TcpStream::connect(addrs.as_slice()).await?;
                     let _ = tcp_stream.set_nodelay(true);
+                    let _ = set_keepalive(&tcp_stream);
                     Ok(tcp_stream)
                 }
             }
@@ -682,33 +697,29 @@ impl ProxyConfig {
         port: u16,
         is_tls: bool,
     ) -> Result<(SendRequest<Incoming>, AbortHandle), ProxyError> {
-        // Retry loop for pooled connections - but limit retries to avoid infinite loops
         let mut attempts = 0;
         const MAX_POOL_ATTEMPTS: u32 = 3;
         
         while attempts < MAX_POOL_ATTEMPTS {
-            if let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
+            let upstream_proxy = self.upstream_proxy.is_some();
+            if let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls, upstream_proxy) {
                 attempts += 1;
                 
-                // Check if connection is still usable with a timeout
-                // ready() can hang if the connection is in a bad state
+                // ready() can hang if connection is in bad state, so use timeout
                 match tokio::time::timeout(Duration::from_millis(100), sender.ready()).await {
                     Ok(Ok(_)) => {
-                        // Additional check: verify the connection task is still running
                         if abort_handle.is_finished() {
-                            // Connection task has finished - connection is dead
                             continue;
                         }
                         return Ok((sender, abort_handle));
                     }
                     Ok(Err(_)) | Err(_) => {
-                        // Connection is broken or timed out, abort and try next
                         abort_handle.abort();
                         continue;
                     }
                 }
             } else {
-                break; // No more pooled connections available
+                break;
             }
         }
 
@@ -717,7 +728,7 @@ impl ProxyConfig {
         if is_tls {
             let host = host_str.to_string();
             let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_client_config));
-            // Remove brackets from IPv6 for ServerName (SNI doesn't use brackets)
+            // SNI doesn't use brackets for IPv6
             let server_name_str = if host.starts_with('[') && host.ends_with(']') {
                 &host[1..host.len()-1]
             } else {
@@ -892,21 +903,19 @@ async fn handle_connect(
 fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
     if let Some(host) = uri.host() {
         let port = uri.port_u16().unwrap_or(443);
-        // Preserve IPv6 brackets in host for proper SNI and Host header usage
+        // IPv6 brackets preserved for SNI and Host header
         return Ok((host.to_string(), port));
     }
 
     if let Some(authority) = uri.authority() {
         let auth_str = authority.as_str();
         if auth_str.starts_with('[') {
-            // IPv6 address - must have closing bracket
             let end_bracket = auth_str.find(']').ok_or_else(|| {
                 ProxyError::InvalidUri(Cow::Owned(format!(
                     "Invalid IPv6 address, missing closing bracket: {}",
                     uri
                 )))
             })?;
-            // Keep brackets for IPv6 addresses (required for Host header and SNI)
             let host = &auth_str[..=end_bracket];
             let rest = &auth_str[end_bracket + 1..];
             if rest.starts_with(':') {
@@ -1112,8 +1121,7 @@ async fn forward_request(
     let resp = match sender.send_request(req).await {
         Ok(resp) => resp,
         Err(e) => {
-            // Abort the connection - body doesn't need to be consumed
-            // as the connection is being torn down anyway
+            config.dns_cache.remove(host);
             abort_handle.abort();
             return Err(e.into());
         }
@@ -1141,7 +1149,7 @@ async fn forward_request(
         );
         Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
     } else {
-        // Do NOT abort immediately; let the body stream out
+        // Let body stream out before aborting
         let body = BodyWithAbortOnEnd::new(incoming_body, abort_handle);
         Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
     }
