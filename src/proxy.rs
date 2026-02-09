@@ -28,6 +28,7 @@ use url::Url;
 
 use crate::certificate::CertificateAuthority;
 
+#[cfg(unix)]
 fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     let sock = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
@@ -37,6 +38,19 @@ fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     sock.set_tcp_keepalive(&ka)?;
     // Prevent socket from being closed when sock is dropped
     let _ = sock.into_raw_fd();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket};
+    let sock = unsafe { Socket::from_raw_socket(stream.as_raw_socket()) };
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    sock.set_tcp_keepalive(&ka)?;
+    // Prevent socket from being closed when sock is dropped
+    let _ = sock.into_raw_socket();
     Ok(())
 }
 
