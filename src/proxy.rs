@@ -54,32 +54,29 @@ pub enum ProxyError {
 struct PooledConnection {
     sender: Option<SendRequest<Incoming>>,
     created_at: Instant,
-    abort_handle: AbortHandle,
+    abort_handle: Option<AbortHandle>,
 }
 
 impl PooledConnection {
     fn is_valid(&self) -> bool {
         self.created_at.elapsed() < CONNECTION_TTL
             && self.sender.is_some()
-            && !self.abort_handle.is_finished()
+            && self.abort_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
     }
-    
+
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
-        self.sender.take().map(|sender| {
-            // Return the actual abort handle - don't replace with dummy
-            let handle = std::mem::replace(
-                &mut self.abort_handle, 
-                tokio::task::spawn(async {}).abort_handle()
-            );
-            (sender, handle)
-        })
+        match (self.sender.take(), self.abort_handle.take()) {
+            (Some(sender), Some(handle)) => Some((sender, handle)),
+            _ => None,
+        }
     }
-    
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        self.abort_handle.abort();
+        if let Some(h) = self.abort_handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -92,47 +89,38 @@ struct ConnKey {
 
 struct ConnectionPool {
     pool: DashMap<ConnKey, Mutex<Vec<PooledConnection>>>,
-    state: Mutex<(LruCache<ConnKey, ()>, usize)>,
-    connection_count: AtomicUsize,
+    state: Mutex<LruCache<ConnKey, usize>>,
+    total: AtomicUsize,
 }
 
 impl ConnectionPool {
     fn new() -> Self {
         Self {
             pool: DashMap::new(),
-            state: Mutex::new((
-                LruCache::new(std::num::NonZeroUsize::new(CONNECTION_POOL_SIZE).unwrap()),
-                0,
+            state: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(CONNECTION_POOL_SIZE).unwrap(),
             )),
-            connection_count: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
         }
     }
 
     fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
-        let key = ConnKey {
-            host: host.to_string(),
-            port,
-            is_tls,
-        };
-
+        let key = ConnKey { host: host.to_string(), port, is_tls };
         if let Some(entry) = self.pool.get(&key) {
             let mut conns = entry.value().lock();
             while let Some(conn) = conns.pop() {
                 if conn.is_valid() {
-                    if let Some(result) = conn.take() {
-                        // Only decrement counters for valid connections being taken
+                    if let Some(pair) = conn.take() {
+                        self.total.fetch_sub(1, Ordering::SeqCst);
                         let mut state = self.state.lock();
-                        state.1 = state.1.saturating_sub(1);
-                        self.connection_count.fetch_sub(1, Ordering::SeqCst);
-                        state.0.put(key.clone(), ());
-                        return Some(result);
+                        let count = state.get(&key).copied().unwrap_or(1).saturating_sub(1);
+                        if count == 0 {
+                            state.pop(&key);
+                        } else {
+                            state.put(key.clone(), count);
+                        }
+                        return Some(pair);
                     }
-                } else {
-                    // Connection expired - decrement counters and abort
-                    let mut state = self.state.lock();
-                    state.1 = state.1.saturating_sub(1);
-                    self.connection_count.fetch_sub(1, Ordering::SeqCst);
-                    conn.abort_handle.abort();
                 }
             }
         }
@@ -140,63 +128,38 @@ impl ConnectionPool {
     }
 
     fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
-        let key = ConnKey { host, port, is_tls };
-        
-        // First, acquire the state lock to check capacity and potentially evict
-        let mut state = self.state.lock();
-        
-        // Evict LRU entries if at capacity (under lock to ensure atomicity)
-        if state.1 >= CONNECTION_POOL_SIZE {
-            if let Some((old_key, _)) = state.0.pop_lru() {
-                if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
-                    let removed_count = conns_mutex.lock().len();
-                    state.1 = state.1.saturating_sub(removed_count);
-                    self.connection_count.fetch_sub(removed_count, Ordering::SeqCst);
-                }
-            }
-        }
-        
-        // Check if we still have room after eviction
-        let current_count = self.connection_count.load(Ordering::SeqCst);
-        if current_count >= CONNECTION_POOL_SIZE {
-            // Still at capacity, abort the new connection
-            drop(state); // Release lock before abort
+        if self.total.load(Ordering::SeqCst) >= CONNECTION_POOL_SIZE {
             abort_handle.abort();
             return;
         }
-        
-        // Increment counter and add to pool atomically under the lock
-        self.connection_count.fetch_add(1, Ordering::SeqCst);
-        state.1 += 1;
-        state.0.put(key.clone(), ());
-        
-        // Release state lock before acquiring DashMap entry lock
-        drop(state);
+        let key = ConnKey { host, port, is_tls };
 
-        let entry = self.pool.entry(key).or_insert_with(|| Mutex::new(Vec::with_capacity(4)));
+        let entry = self.pool.entry(key.clone()).or_insert_with(|| Mutex::new(Vec::with_capacity(4)));
         entry.value().lock().push(PooledConnection {
             sender: Some(sender),
             created_at: Instant::now(),
-            abort_handle,
+            abort_handle: Some(abort_handle),
         });
+
+        self.total.fetch_add(1, Ordering::SeqCst);
+
+        let mut state = self.state.lock();
+        let count = state.get(&key).copied().unwrap_or(0) + 1;
+        state.put(key, count);
     }
 
     fn cleanup(&self) {
-        let mut total_removed = 0;
-        self.pool.retain(|_key, conns_mutex| {
+        let mut removed = 0usize;
+        self.pool.retain(|_, conns_mutex| {
             let mut conns = conns_mutex.lock();
             let before = conns.len();
-            conns.retain(|conn| conn.is_valid());
+            conns.retain(|c| c.is_valid());
             let after = conns.len();
-            total_removed += before - after;
-            
+            removed += before - after;
             after != 0
         });
-
-        if total_removed > 0 {
-            let mut state = self.state.lock();
-            state.1 = state.1.saturating_sub(total_removed);
-            self.connection_count.fetch_sub(total_removed, Ordering::SeqCst);
+        if removed > 0 {
+            self.total.fetch_sub(removed, Ordering::SeqCst);
         }
     }
 }
@@ -292,6 +255,65 @@ impl Drop for BodyWithPoolReturn {
                 handle.abort();
             }
         }
+    }
+}
+
+/// Body wrapper that aborts the connection task after the body is fully consumed.
+/// This prevents truncating the response body when connections are not being pooled.
+struct BodyWithAbortOnEnd {
+    inner: Incoming,
+    abort_handle: Option<AbortHandle>,
+}
+
+impl BodyWithAbortOnEnd {
+    fn new(inner: Incoming, abort_handle: AbortHandle) -> Self {
+        Self {
+            inner,
+            abort_handle: Some(abort_handle),
+        }
+    }
+
+    fn abort(&mut self) {
+        if let Some(h) = self.abort_handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Body for BodyWithAbortOnEnd {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let inner = Pin::new(&mut self.inner);
+        match inner.poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.abort();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.abort();
+                Poll::Ready(Some(Err(e)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for BodyWithAbortOnEnd {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -544,14 +566,16 @@ impl ProxyConfig {
             if let Some(res) = rx.borrow().clone() {
                 return res.map_err(|e| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)));
             }
-            // Check if sender dropped (all receivers gone) - clean up and return error
-            if rx.changed().await.is_err() {
-                // Remove the stale inflight entry
-                self.dns_cache.inflight.remove(&host);
-                return Err(ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "DNS lookup cancelled",
-                )));
+            let changed = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await;
+            match changed {
+                Ok(Ok(_)) => continue,
+                _ => {
+                    self.dns_cache.inflight.remove(&host);
+                    return Err(ProxyError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "DNS lookup cancelled or timed out",
+                    )));
+                }
             }
         }
     }
@@ -627,48 +651,7 @@ impl ProxyConfig {
                             };
                             
                             tcp_stream.write_all(connect_req.as_bytes()).await?;
-
-                            let mut buf = [0u8; 1024];
-                            let mut pos = 0;
-                            let header_end;
-                            
-                            loop {
-                                let n = tcp_stream.read(&mut buf[pos..]).await?;
-                                if n == 0 {
-                                    return Err(ProxyError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "HTTP proxy closed connection during handshake",
-                                    )));
-                                }
-                                pos += n;
-                                
-                                if let Some(idx) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
-                                    header_end = idx + 4;
-                                    break;
-                                }
-                                
-                                if pos == buf.len() {
-                                    // Buffer full without finding headers - invalid response
-                                    return Err(ProxyError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "HTTP proxy response too large or malformed",
-                                    )));
-                                }
-                            }
-
-                            // Check response status using only the header portion
-                            if !buf[..header_end].starts_with(b"HTTP/1.1 200") && !buf[..header_end].starts_with(b"HTTP/1.0 200") {
-                                let first_line = buf[..header_end].split(|&b| b == b'\n').next().unwrap_or(&[]);
-                                return Err(ProxyError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionRefused,
-                                    format!("HTTP proxy CONNECT failed: {}", String::from_utf8_lossy(first_line).trim()),
-                                )));
-                            }
-                            
-                            // Note: Any data after headers (buf[header_end..pos]) would typically be
-                            // the start of TLS handshake from upstream. The TLS connector will read
-                            // this data directly from the stream's internal buffer.
-                            
+                            read_http_connect_status(&mut tcp_stream).await?;
                             Ok(tcp_stream)
                         }
                     }
@@ -831,6 +814,39 @@ pub async fn handle_client(
     Ok(())
 }
 
+async fn read_http_connect_status(stream: &mut TcpStream) -> Result<(), ProxyError> {
+    let mut buf = Vec::with_capacity(1024);
+    loop {
+        let mut tmp = [0u8; 512];
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HTTP proxy closed connection during handshake",
+            )));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP proxy response headers too large",
+            )));
+        }
+    }
+
+    let first_line = buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    if !first_line.starts_with(b"HTTP/1.1 200") && !first_line.starts_with(b"HTTP/1.0 200") {
+        return Err(ProxyError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("HTTP proxy CONNECT failed: {}", String::from_utf8_lossy(first_line).trim()),
+        )));
+    }
+    Ok(())
+}
+
 #[inline]
 async fn handle_request(
     req: Request<Incoming>,
@@ -982,75 +998,59 @@ fn strip_hop_by_hop_headers<T>(req: &mut Request<T>) {
 }
 
 #[inline]
+fn parse_open_ended_range(start: &[u8]) -> Option<u64> {
+    if start.is_empty() || start.contains(&b'-') {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &b in start {
+        if !(b'0'..=b'9').contains(&b) {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(n)
+}
+
+#[inline]
 fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
     if !host.ends_with("googlevideo.com") {
         return false;
     }
-
     let range_header = match req.headers().get(header::RANGE) {
-        Some(h) => h,
+        Some(h) => h.as_bytes(),
         None => return false,
     };
-
-    let range_bytes = range_header.as_bytes();
-    // Handle both "bytes=X-" (open-ended) and "bytes=-X" (suffix) ranges
-    if range_bytes.len() < 8 || !range_bytes.starts_with(b"bytes=") {
+    if !range_header.starts_with(b"bytes=") {
         return false;
     }
 
-    let range_spec = &range_bytes[6..]; // Everything after "bytes="
-    
-    // Check for suffix range: "bytes=-N" (get last N bytes)
+    let range_spec = &range_header[6..];
     if range_spec.starts_with(b"-") {
-        // Suffix range - let it pass through unmodified
-        // These are typically "bytes=-500" to get last 500 bytes
-        return false; // Don't modify suffix ranges
+        return false; // suffix range: don't touch
     }
-    
-    // Check for open-ended range: "bytes=X-"
     if !range_spec.ends_with(b"-") {
-        // Already has an end byte or is a multi-range request - don't modify
-        return false;
+        return false; // already bounded or multi-range
     }
 
     let start_bytes = &range_spec[..range_spec.len() - 1];
-    if start_bytes.is_empty() || start_bytes.contains(&b'-') {
-        return false;
-    }
-
-    let mut start_byte: u64 = 0;
-    for &b in start_bytes {
-        if !(b'0'..=b'9').contains(&b) {
-            return false;
-        }
-        start_byte = match start_byte
-            .checked_mul(10)
-            .and_then(|n| n.checked_add((b - b'0') as u64))
-        {
-            Some(n) => n,
-            None => return false,
-        };
-    }
-
-    // Check for potential overflow before calculating new end byte
-    let new_end_byte = if start_byte > u64::MAX - CHUNK_SIZE + 1 {
-        // Would overflow, use max value
-        u64::MAX
-    } else {
-        start_byte + CHUNK_SIZE - 1
+    let start = match parse_open_ended_range(start_bytes) {
+        Some(v) => v,
+        None => return false,
     };
+
+    let end = start.saturating_add(CHUNK_SIZE.saturating_sub(1));
 
     let mut buf = Vec::with_capacity(48);
     buf.extend_from_slice(b"bytes=");
-    push_u64(&mut buf, start_byte);
+    push_u64(&mut buf, start);
     buf.push(b'-');
-    push_u64(&mut buf, new_end_byte);
+    push_u64(&mut buf, end);
 
     let val = match http::HeaderValue::from_bytes(&buf) {
         Ok(v) => v,
         Err(_) => return false,
     };
-
     req.headers_mut().insert(header::RANGE, val);
     true
 }
@@ -1068,6 +1068,12 @@ async fn forward_request(
     is_tls: bool,
     config: Arc<ProxyConfig>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
+    let req_wants_close = req
+        .headers()
+        .get(header::CONNECTION)
+        .map(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
+        .unwrap_or(false);
+
     strip_hop_by_hop_headers(&mut req);
 
     if config.bypass_chunk_modification {
@@ -1084,12 +1090,11 @@ async fn forward_request(
     let host_header = if port == default_port {
         http::HeaderValue::from_str(host)
     } else {
-        http::HeaderValue::from_maybe_shared(format!("{}:{}", host, port))
+        http::HeaderValue::from_str(&format!("{}:{}", host, port))
     }
     .map_err(|_| ProxyError::InvalidUri(Cow::Owned(format!("Invalid host header: {}:{}", host, port))))?;
 
     let (mut parts, body) = req.into_parts();
-
 
     if is_tls {
         let path_and_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
@@ -1101,7 +1106,7 @@ async fn forward_request(
             .map_err(|e| ProxyError::InvalidUri(Cow::Owned(e.to_string())))?;
     }
 
-    parts.headers.insert(header::HOST, host_header);
+    parts.headers.insert(header::HOST, host_header.clone());
 
     let req = Request::from_parts(parts, body);
     let resp = match sender.send_request(req).await {
@@ -1116,8 +1121,8 @@ async fn forward_request(
 
     let (parts, incoming_body) = resp.into_parts();
 
-
-    let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
+    let can_reuse = !req_wants_close
+        && parts.status != StatusCode::SWITCHING_PROTOCOLS
         && !sender.is_closed()
         && parts.headers
             .get(header::CONNECTION)
@@ -1136,11 +1141,9 @@ async fn forward_request(
         );
         Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
     } else {
-        abort_handle.abort();
-        Ok(Response::from_parts(
-            parts,
-            incoming_body.map_err(|e| e).boxed(),
-        ))
+        // Do NOT abort immediately; let the body stream out
+        let body = BodyWithAbortOnEnd::new(incoming_body, abort_handle);
+        Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
     }
 }
 
