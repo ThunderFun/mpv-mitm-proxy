@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -82,6 +82,7 @@ struct PooledConnection {
     sender: Option<SendRequest<Incoming>>,
     created_at: Instant,
     abort_handle: Option<AbortHandle>,
+    epoch: u64,
 }
 
 impl PooledConnection {
@@ -123,6 +124,7 @@ struct ConnectionPool {
     pool: DashMap<ConnKey, Mutex<Vec<PooledConnection>>>,
     state: Mutex<LruCache<ConnKey, usize>>,
     total: AtomicUsize,
+    epoch: AtomicU64,
 }
 
 impl ConnectionPool {
@@ -133,14 +135,31 @@ impl ConnectionPool {
                 std::num::NonZeroUsize::new(CONNECTION_POOL_SIZE).unwrap(),
             )),
             total: AtomicUsize::new(0),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn get(&self, host: &str, port: u16, is_tls: bool, upstream_proxy: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
         let key = ConnKey { host: host.to_string(), port, is_tls };
+        let current_epoch = self.current_epoch();
+
         if let Some(entry) = self.pool.get(&key) {
             let mut conns = entry.value().lock();
             while let Some(conn) = conns.pop() {
+                if conn.epoch != current_epoch {
+                    if let Some(ref h) = conn.abort_handle {
+                        h.abort();
+                    }
+                    continue;
+                }
                 if conn.is_valid(upstream_proxy) {
                     if let Some(pair) = conn.take() {
                         self.total.fetch_sub(1, Ordering::SeqCst);
@@ -171,6 +190,7 @@ impl ConnectionPool {
             sender: Some(sender),
             created_at: Instant::now(),
             abort_handle: Some(abort_handle),
+            epoch: self.current_epoch(),
         });
 
         self.total.fetch_add(1, Ordering::SeqCst);
@@ -182,10 +202,19 @@ impl ConnectionPool {
 
     fn cleanup(&self) {
         let mut removed = 0usize;
+        let current_epoch = self.current_epoch();
         self.pool.retain(|_, conns_mutex| {
             let mut conns = conns_mutex.lock();
             let before = conns.len();
-            conns.retain(|c| c.is_valid(false));
+            conns.retain(|c| {
+                if c.epoch != current_epoch {
+                    if let Some(ref h) = c.abort_handle {
+                        h.abort();
+                    }
+                    return false;
+                }
+                c.is_valid(false)
+            });
             let after = conns.len();
             removed += before - after;
             after != 0
@@ -203,6 +232,7 @@ struct BodyWithPoolReturn {
     sender: Option<SendRequest<Incoming>>,
     abort_handle: Option<AbortHandle>,
     healthy: bool,
+    completed: bool,
 }
 
 impl BodyWithPoolReturn {
@@ -222,10 +252,12 @@ impl BodyWithPoolReturn {
             sender: Some(sender),
             abort_handle: Some(abort_handle),
             healthy: true,
+            completed: false,
         }
     }
 
     fn return_to_pool(&mut self) {
+        self.completed = true;
         if !self.healthy {
             if let Some(h) = self.abort_handle.take() {
                 h.abort();
@@ -281,10 +313,14 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        // Abort only if connection wasn't returned to pool (sender is None)
-        if self.sender.is_some() {
+        // If body wasn't completed (returned to pool or errored),
+        // give a grace period before aborting to prevent data truncation
+        if !self.completed && self.sender.is_some() {
             if let Some(handle) = self.abort_handle.take() {
-                handle.abort();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    handle.abort();
+                });
             }
         }
     }
@@ -295,6 +331,7 @@ impl Drop for BodyWithPoolReturn {
 struct BodyWithAbortOnEnd {
     inner: Incoming,
     abort_handle: Option<AbortHandle>,
+    completed: bool,
 }
 
 impl BodyWithAbortOnEnd {
@@ -302,6 +339,7 @@ impl BodyWithAbortOnEnd {
         Self {
             inner,
             abort_handle: Some(abort_handle),
+            completed: false,
         }
     }
 
@@ -323,10 +361,12 @@ impl Body for BodyWithAbortOnEnd {
         let inner = Pin::new(&mut self.inner);
         match inner.poll_frame(cx) {
             Poll::Ready(None) => {
+                self.completed = true;
                 self.abort();
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
+                self.completed = true;
                 self.abort();
                 Poll::Ready(Some(Err(e)))
             }
@@ -345,7 +385,18 @@ impl Body for BodyWithAbortOnEnd {
 
 impl Drop for BodyWithAbortOnEnd {
     fn drop(&mut self) {
-        self.abort();
+        // Only abort if the body wasn't fully consumed
+        // If the body completed normally, the abort already happened in poll_frame
+        if !self.completed {
+            // Give a small grace period for any in-flight data to be processed
+            // before aborting the connection
+            if let Some(handle) = self.abort_handle.take() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    handle.abort();
+                });
+            }
+        }
     }
 }
 
@@ -714,8 +765,9 @@ impl ProxyConfig {
         let mut attempts = 0;
         const MAX_POOL_ATTEMPTS: u32 = 3;
         
+        let upstream_proxy = self.upstream_proxy.is_some();
+        
         while attempts < MAX_POOL_ATTEMPTS {
-            let upstream_proxy = self.upstream_proxy.is_some();
             if let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls, upstream_proxy) {
                 attempts += 1;
                 
@@ -727,7 +779,7 @@ impl ProxyConfig {
                         }
                         return Ok((sender, abort_handle));
                     }
-                    Ok(Err(_)) | Err(_) => {
+                    _ => {
                         abort_handle.abort();
                         continue;
                     }
@@ -737,7 +789,15 @@ impl ProxyConfig {
             }
         }
 
-        let upstream_tcp = self.connect(host_str, port).await?;
+        let upstream_tcp = match self.connect(host_str, port).await {
+            Ok(s) => s,
+            Err(e) => {
+                if self.upstream_proxy.is_some() {
+                    self.connection_pool.bump_epoch();
+                }
+                return Err(e);
+            }
+        };
 
         if is_tls {
             let host = host_str.to_string();
@@ -1132,12 +1192,34 @@ async fn forward_request(
     parts.headers.insert(header::HOST, host_header.clone());
 
     let req = Request::from_parts(parts, body);
-    let resp = match sender.send_request(req).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            config.dns_cache.remove(host);
-            abort_handle.abort();
-            return Err(e.into());
+    let upstream_proxy = config.upstream_proxy.is_some();
+
+    let resp = if upstream_proxy {
+        match tokio::time::timeout(Duration::from_secs(5), sender.send_request(req)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                config.connection_pool.bump_epoch();
+                config.dns_cache.remove(host);
+                abort_handle.abort();
+                return Err(e.into());
+            }
+            Err(_) => {
+                config.connection_pool.bump_epoch();
+                abort_handle.abort();
+                return Err(ProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Upstream send timed out",
+                )));
+            }
+        }
+    } else {
+        match sender.send_request(req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                config.dns_cache.remove(host);
+                abort_handle.abort();
+                return Err(e.into());
+            }
         }
     };
 
