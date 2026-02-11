@@ -6,33 +6,19 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
-use dashmap::DashMap;
-use tokio::sync::{watch, Mutex};
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum CertError {
     #[error("Certificate generation failed: {0}")]
-    Generation(String),
+    Generation(#[from] rcgen::Error),
     #[error("TLS configuration failed: {0}")]
-    Tls(String),
+    Tls(#[from] rustls::Error),
     #[error("Lock error")]
     Lock,
-}
-
-impl From<rcgen::Error> for CertError {
-    fn from(e: rcgen::Error) -> Self {
-        CertError::Generation(e.to_string())
-    }
-}
-
-impl From<rustls::Error> for CertError {
-    fn from(e: rustls::Error) -> Self {
-        CertError::Tls(e.to_string())
-    }
 }
 
 struct CaData {
@@ -43,10 +29,6 @@ struct CaData {
 pub struct CertificateAuthority {
     ca_data: Mutex<Option<CaData>>,
     cache: Mutex<LruCache<String, Arc<ServerConfig>>>,
-    // Inflight map to prevent concurrent certificate generation for same hostname
-    inflight: DashMap<String, watch::Receiver<Option<Result<Arc<ServerConfig>, CertError>>>>,
-    // Separate flag for CA initialization to prevent duplicate CA generation
-    ca_init_inflight: Mutex<Option<watch::Receiver<bool>>>,
 }
 
 impl CertificateAuthority {
@@ -76,70 +58,22 @@ impl CertificateAuthority {
         Ok(Self {
             ca_data: Mutex::new(Some(CaData { ca_cert, ca_key })),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
-            inflight: DashMap::new(),
-            ca_init_inflight: Mutex::new(None),
         })
     }
 
-    async fn ensure_initialized(&self) -> Result<(), CertError> {
-        // Fast path: check if already initialized
+    fn ensure_initialized(&self) -> Result<(), CertError> {
         {
-            let ca_data = self.ca_data.lock().await;
+            let ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
             if ca_data.is_some() {
                 return Ok(());
             }
         }
 
-        // Slow path: need to initialize - use ca_init_inflight to prevent duplicate work
-        let mut ca_init_guard = self.ca_init_inflight.lock().await;
-        
-        if let Some(rx) = ca_init_guard.as_ref() {
-            // Another task is initializing, wait for it
-            let mut rx = rx.clone();
-            drop(ca_init_guard);
-            loop {
-                if *rx.borrow() {
-                    // Initialization complete (success or failure)
-                    let ca_data = self.ca_data.lock().await;
-                    return if ca_data.is_some() {
-                        Ok(())
-                    } else {
-                        Err(CertError::Generation("CA initialization failed".to_string()))
-                    };
-                }
-                if rx.changed().await.is_err() {
-                    return Err(CertError::Lock);
-                }
-            }
-        }
-
-        // We are the one to initialize
-        let (tx, rx) = watch::channel(false);
-        *ca_init_guard = Some(rx);
-        drop(ca_init_guard);
-
-        // Double-check under the lock
-        {
-            let ca_data = self.ca_data.lock().await;
-            if ca_data.is_some() {
-                let _ = tx.send(true);
-                *self.ca_init_inflight.lock().await = None;
-                return Ok(());
-            }
-        }
-
-        // Perform initialization
-        let result = self.do_initialize().await;
-        let _ = tx.send(true);
-        *self.ca_init_inflight.lock().await = None;
-        result
-    }
-    
-    async fn do_initialize(&self) -> Result<(), CertError> {
-        let mut ca_data = self.ca_data.lock().await;
+        let mut ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
         if ca_data.is_some() {
             return Ok(());
         }
+
 
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
@@ -166,67 +100,32 @@ impl CertificateAuthority {
         Ok(())
     }
 
-    pub async fn get_server_config(self: &Arc<Self>, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
-        // Check cache first
+    pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
         {
-            let mut cache = self.cache.lock().await;
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
             if let Some(config) = cache.get(hostname) {
                 return Ok(Arc::clone(config));
             }
         }
 
-        self.ensure_initialized().await?;
+        self.ensure_initialized()?;
 
-        // Use inflight mechanism to prevent concurrent generation for same hostname
-        use dashmap::mapref::entry::Entry;
-        
-        let rx = match self.inflight.entry(hostname.to_string()) {
-            Entry::Occupied(occ) => occ.get().clone(),
-            Entry::Vacant(vac) => {
-                let (tx, rx) = watch::channel(None);
-                vac.insert(rx.clone());
-                
-                let hostname = hostname.to_string();
-                let self_arc = Arc::clone(self);
-                
-                tokio::spawn(async move {
-                    let result = self_arc.generate_server_config(&hostname).await;
-                    match result {
-                        Ok(config) => {
-                            let config = Arc::new(config);
-                            let _ = tx.send(Some(Ok(Arc::clone(&config))));
-                            // Store in cache
-                            let mut cache = self_arc.cache.lock().await;
-                            cache.put(hostname.clone(), Arc::clone(&config));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Some(Err(e)));
-                        }
-                    }
-                    self_arc.inflight.remove(&hostname);
-                });
-                rx
-            }
-        };
+        let config = self.generate_server_config(hostname)?;
+        let config = Arc::new(config);
 
-        // Wait for the result
-        let mut rx = rx;
-        loop {
-            if let Some(res) = rx.borrow().clone() {
-                return res;
-            }
-            if rx.changed().await.is_err() {
-                return Err(CertError::Lock);
-            }
+        {
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            cache.put(hostname.to_string(), Arc::clone(&config));
         }
+
+        Ok(config)
     }
 
-    async fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
-        // Use lock().await since this is called from an async context
-        let ca_data_guard = self.ca_data.lock().await;
+    fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
+        let ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock)?;
         let ca_data = ca_data_guard
             .as_ref()
-            .ok_or_else(|| CertError::Generation("Could not parse certificate".to_string()))?;
+            .ok_or_else(|| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?;
 
         let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
@@ -245,7 +144,7 @@ impl CertificateAuthority {
         server_params.subject_alt_names = vec![SanType::DnsName(
             hostname
                 .try_into()
-                .map_err(|_| CertError::Generation("Could not parse certificate".to_string()))?,
+                .map_err(|_| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?,
         )];
 
         let now = OffsetDateTime::now_utc();

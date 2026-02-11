@@ -37,10 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
     let bypass_chunk_modification = args.iter().any(|a| a == "--bypass-chunk-modification");
-    let debug = args.iter().any(|a| a == "--debug");
 
     let ca = Arc::new(CertificateAuthority::new()?);
-    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn, bypass_chunk_modification, debug);
+    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn, bypass_chunk_modification);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let listener = TcpListener::bind(addr).await?;
@@ -57,9 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = proxy::handle_client(stream, client_addr, config).await;
                         });
                     }
-                    Err(e) => {
-                        eprintln!("[MAIN] Error accepting connection: {}", e);
-                    }
+                    Err(_) => {}
                 }
             }
             _ = signal::ctrl_c() => {
