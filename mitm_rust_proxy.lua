@@ -260,6 +260,9 @@ start_proxy_background = function()
     if opts.direct_cdn then
         table.insert(args, "--direct-cdn")
     end
+    if opts.bypass_chunk_modification then
+        table.insert(args, "--bypass-chunk-modification")
+    end
     proxy_port = port_attempt
     apply_proxy_settings()
     mitm_job = mp.command_native_async({
