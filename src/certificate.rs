@@ -32,10 +32,8 @@ pub struct CertificateAuthority {
 }
 
 impl CertificateAuthority {
-    pub fn new() -> Result<Self, CertError> {
-
+    fn generate_ca() -> Result<CaData, CertError> {
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
@@ -43,64 +41,37 @@ impl CertificateAuthority {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "MPV MITM Proxy CA");
         dn.push(DnType::OrganizationName, "MPV Proxy");
         ca_params.distinguished_name = dn;
-
         let now = OffsetDateTime::now_utc();
         ca_params.not_before = now;
         ca_params.not_after = now + Duration::from_secs(365 * 24 * 60 * 60 * 10);
-
         let ca_cert = ca_params.self_signed(&ca_key)?;
+        Ok(CaData { ca_cert, ca_key })
+    }
 
+    pub fn new() -> Result<Self, CertError> {
+        let ca_data = Self::generate_ca()?;
         Ok(Self {
-            ca_data: Mutex::new(Some(CaData { ca_cert, ca_key })),
+            ca_data: Mutex::new(Some(ca_data)),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
         })
     }
 
     fn ensure_initialized(&self) -> Result<(), CertError> {
-        {
-            let ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
-            if ca_data.is_some() {
-                return Ok(());
-            }
-        }
-
-        let mut ca_data = self.ca_data.lock().map_err(|_| CertError::Lock)?;
-        if ca_data.is_some() {
+        let mut ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+        if ca_data_guard.is_some() {
             return Ok(());
         }
-
-
-        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "MPV MITM Proxy CA");
-        dn.push(DnType::OrganizationName, "MPV Proxy");
-        ca_params.distinguished_name = dn;
-
-        let now = OffsetDateTime::now_utc();
-        ca_params.not_before = now;
-        ca_params.not_after = now + Duration::from_secs(365 * 24 * 60 * 60 * 10);
-
-        let ca_cert = ca_params.self_signed(&ca_key)?;
-        *ca_data = Some(CaData { ca_cert, ca_key });
-
+        let ca_data = Self::generate_ca()?;
+        *ca_data_guard = Some(ca_data);
         Ok(())
     }
 
     pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
+        // Fast path: check cache without generating
         {
             let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
             if let Some(config) = cache.get(hostname) {
@@ -110,11 +81,17 @@ impl CertificateAuthority {
 
         self.ensure_initialized()?;
 
+        // Slow path: generate config (this is expensive, done outside any lock)
         let config = self.generate_server_config(hostname)?;
         let config = Arc::new(config);
 
+        // Insert into cache, but check again in case another thread already inserted
         {
             let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            // Use get_or_insert pattern to avoid redundant work
+            if let Some(existing) = cache.get(hostname) {
+                return Ok(Arc::clone(existing));
+            }
             cache.put(hostname.to_string(), Arc::clone(&config));
         }
 

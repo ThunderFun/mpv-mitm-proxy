@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use http::{header, Method, Request, Response, StatusCode, Uri};
+use http::{header::*, Method, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -11,7 +11,6 @@ use hyper_util::rt::TokioIo;
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::borrow::Cow;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -26,11 +25,40 @@ use url::Url;
 
 use crate::certificate::CertificateAuthority;
 
-const CHUNK_SIZE: u64 = 10 * 1024 * 1024; 
+/// Load root certificates from the system for TLS verification.
+fn root_certs() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    
+    if let Some(e) = cert_result.errors.first() {
+        eprintln!("Warning: some certificates failed to load: {}", e);
+    }
+    
+    for cert in cert_result.certs {
+        if let Err(e) = root_store.add(cert) {
+            eprintln!("Warning: failed to add certificate: {}", e);
+        }
+    }
+    
+    root_store
+}
+
+#[inline]
+fn configure_http1_builder(
+    client: &mut hyper::client::conn::http1::Builder,
+    server: &mut hyper::server::conn::http1::Builder,
+) {
+    client.preserve_header_case(true).title_case_headers(true);
+    server.preserve_header_case(true).title_case_headers(true);
+}
+
+const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 const CONNECTION_POOL_SIZE: usize = 100;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
-const DNS_CACHE_SIZE: usize = 256;
-const DNS_CACHE_TTL: Duration = Duration::from_secs(300); 
+
+// Type aliases for repeated complex types
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
+type ProxyResult<T> = Result<T, ProxyError>;
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -53,7 +81,7 @@ pub enum ProxyError {
 struct PooledConnection {
     sender: Option<SendRequest<Incoming>>,
     created_at: Instant,
-    abort_handle: AbortHandle,
+    abort_handle: Option<AbortHandle>,
 }
 
 impl PooledConnection {
@@ -62,28 +90,23 @@ impl PooledConnection {
     }
     
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
-        self.sender.take().map(|sender| {
-            let handle = std::mem::replace(
-                &mut self.abort_handle, 
-                tokio::task::spawn(async {}).abort_handle()
-            );
-            (sender, handle)
-        })
+        let sender = self.sender.take()?;
+        let abort_handle = self.abort_handle.take()?;
+        // Prevent Drop from running since we're taking ownership
+        std::mem::forget(self);
+        Some((sender, abort_handle))
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        self.abort_handle.abort();
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
     }
 }
 
-#[derive(Hash, Eq, PartialEq, Clone)]
-struct ConnKey {
-    host: String,
-    port: u16,
-    is_tls: bool,
-}
+type ConnKey = (String, u16, bool); // (host, port, is_tls)
 
 struct ConnectionPool {
     pool: DashMap<ConnKey, Mutex<Vec<PooledConnection>>>,
@@ -102,31 +125,34 @@ impl ConnectionPool {
     }
 
     fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
-        let key = ConnKey {
-            host: host.to_string(),
-            port,
-            is_tls,
-        };
+        let key: ConnKey = (host.to_string(), port, is_tls);
 
-        if let Some(entry) = self.pool.get(&key) {
-            let mut conns = entry.value().lock();
-            while let Some(conn) = conns.pop() {
+        loop {
+            let conn_option = self.pool.get(&key).and_then(|entry| {
+                let mut conns = entry.value().lock();
+                conns.pop()
+            });
+
+            if let Some(conn) = conn_option {
                 let mut state = self.state.lock();
                 state.1 = state.1.saturating_sub(1);
                 state.0.put(key.clone(), ());
+                drop(state);
 
                 if conn.is_valid() {
                     if let Some(result) = conn.take() {
                         return Some(result);
                     }
                 }
+                continue;
             }
+            break;
         }
         None
     }
 
     fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
-        let key = ConnKey { host, port, is_tls };
+        let key: ConnKey = (host, port, is_tls);
         
         {
             let mut state = self.state.lock();
@@ -152,7 +178,7 @@ impl ConnectionPool {
         entry.value().lock().push(PooledConnection {
             sender: Some(sender),
             created_at: Instant::now(),
-            abort_handle,
+            abort_handle: Some(abort_handle),
         });
     }
 
@@ -247,61 +273,14 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        if let Some(handle) = self.abort_handle.take() {
+        // If we still have a sender and abort_handle, the connection wasn't returned
+        // Try to return it to the pool instead of dropping it
+        if self.sender.is_some() && self.abort_handle.is_some() {
+            self.return_to_pool();
+        } else if let Some(handle) = self.abort_handle.take() {
+            // No sender but still have handle - abort it
             handle.abort();
         }
-    }
-}
-
-struct DnsCacheEntry {
-    result: Result<Vec<IpAddr>, String>,
-    expires_at: Instant,
-    stale_at: Instant,
-}
-
-struct DnsCache {
-    cache: Mutex<LruCache<String, Arc<DnsCacheEntry>>>,
-    inflight: DashMap<String, tokio::sync::watch::Receiver<Option<Result<Vec<IpAddr>, String>>>>,
-}
-
-impl DnsCache {
-    fn new() -> Self {
-        Self {
-            cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(DNS_CACHE_SIZE).unwrap(),
-            )),
-            inflight: DashMap::new(),
-        }
-    }
-
-    fn get(&self, host: &str) -> (Option<Result<Vec<IpAddr>, String>>, bool) {
-        let mut cache = self.cache.lock();
-        if let Some(entry) = cache.get(host) {
-            let now = Instant::now();
-            if now < entry.expires_at {
-                return (Some(entry.result.clone()), false);
-            } else if now < entry.stale_at {
-                return (Some(entry.result.clone()), true);
-            }
-            cache.pop(host);
-        }
-        (None, false)
-    }
-
-    fn put(&self, host: String, result: Result<Vec<IpAddr>, String>) {
-        let now = Instant::now();
-        let (ttl, stale_ttl) = if result.is_ok() {
-            (DNS_CACHE_TTL, DNS_CACHE_TTL * 2)
-        } else {
-            (Duration::from_secs(30), Duration::from_secs(60)) 
-        };
-
-        let entry = Arc::new(DnsCacheEntry {
-            result,
-            expires_at: now + ttl,
-            stale_at: now + stale_ttl,
-        });
-        self.cache.lock().put(host, entry);
     }
 }
 
@@ -316,11 +295,12 @@ pub struct ProxyConfig {
     pub ca: Arc<CertificateAuthority>,
     tls_client_config: Arc<rustls::ClientConfig>,
     connection_pool: Arc<ConnectionPool>,
-    dns_cache: Arc<DnsCache>,
     client_http1_builder: hyper::client::conn::http1::Builder,
     server_http1_builder: hyper::server::conn::http1::Builder,
     direct_cdn: bool,
     pub bypass_chunk_modification: bool,
+    disable_pooling: bool,
+    _verify_tls: bool,  // Stored for consistency, used during construction
 }
 
 struct UpstreamProxy {
@@ -331,12 +311,15 @@ struct UpstreamProxy {
     password: Option<String>,
 }
 
+
 impl ProxyConfig {
     pub fn new(
         upstream_url: Option<String>,
         ca: Arc<CertificateAuthority>,
         direct_cdn: bool,
         bypass_chunk_modification: bool,
+        disable_pooling: bool,
+        verify_tls: bool,
     ) -> Arc<Self> {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
@@ -363,130 +346,55 @@ impl ProxyConfig {
             })
         });
 
-        let tls_client_config = Arc::new(
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth(),
-        );
+        let tls_client_config = if verify_tls {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_certs())
+                    .with_no_client_auth(),
+            )
+        } else {
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth(),
+            )
+        };
 
         let connection_pool = Arc::new(ConnectionPool::new());
-        let dns_cache = Arc::new(DnsCache::new());
 
         let mut client_http1_builder = hyper::client::conn::http1::Builder::new();
-        client_http1_builder.preserve_header_case(true);
-        client_http1_builder.title_case_headers(true);
-
         let mut server_http1_builder = hyper::server::conn::http1::Builder::new();
-        server_http1_builder.preserve_header_case(true);
-        server_http1_builder.title_case_headers(true);
+        configure_http1_builder(&mut client_http1_builder, &mut server_http1_builder);
 
-        let pool_clone = Arc::clone(&connection_pool);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                pool_clone.cleanup();
-            }
-        });
+        // Only spawn cleanup task if pooling is enabled
+        if !disable_pooling {
+            let pool_clone = Arc::clone(&connection_pool);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    pool_clone.cleanup();
+                }
+            });
+        }
 
-        let config = Arc::new(Self {
+        Arc::new(Self {
             upstream_proxy,
             ca,
             tls_client_config,
             connection_pool,
-            dns_cache,
             client_http1_builder,
             server_http1_builder,
             direct_cdn,
             bypass_chunk_modification,
-        });
-
-        let config_clone = Arc::clone(&config);
-        tokio::spawn(async move {
-            let domains = ["www.youtube.com", "youtube.com"];
-            for domain in domains {
-                let _ = config_clone.perform_dns_lookup(domain.to_string()).await;
-            }
-        });
-
-        config
-    }
-
-    async fn resolve_host(self: &Arc<Self>, host: &str, port: u16) -> Result<Vec<SocketAddr>, ProxyError> {
-        let (cached, is_stale) = self.dns_cache.get(host);
-        
-        if let Some(result) = cached {
-            if is_stale {
-                let self_clone = Arc::clone(self);
-                let host_owned = host.to_string();
-                tokio::spawn(async move {
-                    let _ = self_clone.perform_dns_lookup(host_owned).await;
-                });
-            }
-            return match result {
-                Ok(ips) => Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
-                Err(e) => Err(ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e))),
-            };
-        }
-
-        let ips = self.perform_dns_lookup(host.to_string()).await?;
-        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
-    }
-
-    async fn perform_dns_lookup(&self, host: String) -> Result<Vec<IpAddr>, ProxyError> {
-        use dashmap::mapref::entry::Entry;
-        
-        let rx = match self.dns_cache.inflight.entry(host.clone()) {
-            Entry::Occupied(occ) => occ.get().clone(),
-            Entry::Vacant(vac) => {
-                let (tx, rx) = tokio::sync::watch::channel(None);
-                vac.insert(rx.clone());
-                
-                let host_clone = host.clone();
-                let dns_cache = Arc::clone(&self.dns_cache);
-                tokio::spawn(async move {
-                    let host_for_lookup = host_clone.clone();
-                    let res: Result<Vec<IpAddr>, String> = tokio::task::spawn_blocking(move || {
-                        (host_for_lookup.as_str(), 0u16)
-                            .to_socket_addrs()
-                            .map(|iter| {
-                                let ips: Vec<IpAddr> = iter.map(|addr| addr.ip()).collect();
-                                if ips.is_empty() {
-                                    Err(format!("No addresses found for {}", host_for_lookup))
-                                } else {
-                                    Ok(ips)
-                                }
-                            })
-                            .unwrap_or_else(|e| Err(e.to_string()))
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
-
-                    dns_cache.put(host_clone.clone(), res.clone());
-                    let _ = tx.send(Some(res));
-                    dns_cache.inflight.remove(&host_clone);
-                });
-                rx
-            }
-        };
-
-        let mut rx = rx;
-        loop {
-            if let Some(res) = rx.borrow().clone() {
-                return res.map_err(|e| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)));
-            }
-            if rx.changed().await.is_err() {
-                return Err(ProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "DNS lookup task dropped",
-                )));
-            }
-        }
+            disable_pooling,
+            _verify_tls: verify_tls,
+        })
     }
 
     #[inline]
-    async fn connect(self: &Arc<Self>, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
+    async fn connect(self: &Arc<Self>, host: &str, port: u16) -> ProxyResult<TcpStream> {
         let self_clone = Arc::clone(self);
         let host_owned = host.to_string();
         let connect_fut = async move {
@@ -494,14 +402,15 @@ impl ProxyConfig {
             
             match &self_clone.upstream_proxy {
                 Some(proxy) if !use_direct => {
-                    let proxy_addrs = self_clone.resolve_host(&proxy.host, proxy.port).await?;
+                    let proxy_host = proxy.host.as_str();
+                    let proxy_port = proxy.port;
                     
                     match proxy.proxy_type {
                         ProxyType::Socks5 => {
                             let stream = match (&proxy.username, &proxy.password) {
                                 (Some(user), Some(pass)) => {
                                     Socks5Stream::connect_with_password(
-                                        proxy_addrs.as_slice(),
+                                        (proxy_host, proxy_port),
                                         (host_owned.as_str(), port),
                                         user,
                                         pass,
@@ -509,7 +418,7 @@ impl ProxyConfig {
                                     .await?
                                 }
                                 _ => {
-                                    Socks5Stream::connect(proxy_addrs.as_slice(), (host_owned.as_str(), port)).await?
+                                    Socks5Stream::connect((proxy_host, proxy_port), (host_owned.as_str(), port)).await?
                                 }
                             };
                             let tcp_stream = stream.into_inner();
@@ -517,23 +426,10 @@ impl ProxyConfig {
                             Ok(tcp_stream)
                         }
                         ProxyType::Http => {
-                            let mut tcp_stream = TcpStream::connect(proxy_addrs.as_slice()).await?;
+                            let mut tcp_stream = TcpStream::connect(format!("{}:{}", proxy_host, proxy_port)).await?;
                             let _ = tcp_stream.set_nodelay(true);
 
-                            let connect_req = if let (Some(user), Some(pass)) = (&proxy.username, &proxy.password) {
-                                use base64::Engine;
-                                let credentials = base64::engine::general_purpose::STANDARD
-                                    .encode(format!("{}:{}", user, pass));
-                                format!(
-                                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Authorization: Basic {}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                                    host_owned, port, host_owned, port, credentials
-                                )
-                            } else {
-                                format!(
-                                    "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                                    host_owned, port, host_owned, port
-                                )
-                            };
+                            let connect_req = build_http_connect_request(&host_owned, port, &proxy.username, &proxy.password);
                             
                             tcp_stream.write_all(connect_req.as_bytes()).await?;
 
@@ -550,12 +446,19 @@ impl ProxyConfig {
                                 }
                                 pos += n;
                                 
-                                if buf[..pos].windows(4).any(|w| w == b"\r\n\r\n") {
-                                    break;
+                                static HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+                                if pos >= 4 {
+                                    let search_start = pos.saturating_sub(n + 3);
+                                    if buf[search_start..pos].windows(4).any(|w| w == HEADER_TERMINATOR) {
+                                        break;
+                                    }
                                 }
                                 
-                                if pos == buf.len() {
-                                    break; 
+                                if pos >= buf.len() {
+                                    return Err(ProxyError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP proxy response exceeds buffer size without valid terminator",
+                                    )));
                                 }
                             }
 
@@ -572,23 +475,39 @@ impl ProxyConfig {
                     }
                 }
                 _ => {
-                    let addrs = self_clone.resolve_host(&host_owned, port).await?;
-                    let tcp_stream = TcpStream::connect(addrs.as_slice()).await?;
+                    let tcp_stream = TcpStream::connect(format!("{}:{}", host_owned, port)).await?;
                     let _ = tcp_stream.set_nodelay(true);
                     Ok(tcp_stream)
                 }
             }
         };
 
-        let res = match tokio::time::timeout(Duration::from_secs(10), connect_fut).await {
+        match tokio::time::timeout(Duration::from_secs(10), connect_fut).await {
             Ok(res) => res,
             Err(_) => Err(ProxyError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("Connection to {}:{} timed out after 10s", host, port),
             ))),
-        };
+        }
+    }
 
-        res
+    // Helper function to perform HTTP/1 handshake and return sender with abort handle
+    async fn handshake_upstream<IO>(
+        &self,
+        io: IO,
+    ) -> ProxyResult<(SendRequest<Incoming>, AbortHandle)>
+    where
+        IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
+        match self.client_http1_builder.handshake(io).await {
+            Ok((sender, conn)) => {
+                let handle = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                Ok((sender, handle.abort_handle()))
+            }
+            Err(e) => Err(ProxyError::Hyper(e)),
+        }
     }
 
     async fn get_or_create_connection(
@@ -596,17 +515,17 @@ impl ProxyConfig {
         host_str: &str,
         port: u16,
         is_tls: bool,
-    ) -> Result<(SendRequest<Incoming>, AbortHandle), ProxyError> {
-        while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
-            match sender.ready().await {
-                Ok(_) => return Ok((sender, abort_handle)),
-                Err(_) => {
-                    abort_handle.abort();
-                    continue;
+    ) -> ProxyResult<(SendRequest<Incoming>, AbortHandle)> {
+        if !self.disable_pooling {
+            while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
+                match sender.ready().await {
+                    Ok(_) => return Ok((sender, abort_handle)),
+                    Err(_) => {
+                        abort_handle.abort();
+                    }
                 }
             }
         }
-
 
         let upstream_tcp = self.connect(host_str, port).await?;
 
@@ -617,42 +536,61 @@ impl ProxyConfig {
                 .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
             let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
             let upstream_io = TokioIo::new(upstream_tls);
-            match self.client_http1_builder.handshake(upstream_io).await {
-                Ok((sender, conn)) => {
-                    let handle = tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    Ok((sender, handle.abort_handle()))
-                }
-                Err(e) => Err(ProxyError::Hyper(e)),
-            }
+            self.handshake_upstream(upstream_io).await
         } else {
             let upstream_io = TokioIo::new(upstream_tcp);
-            match self.client_http1_builder.handshake(upstream_io).await {
-                Ok((sender, conn)) => {
-                    let handle = tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    Ok((sender, handle.abort_handle()))
-                }
-                Err(e) => Err(ProxyError::Hyper(e)),
-            }
+            self.handshake_upstream(upstream_io).await
         }
     }
 }
 
+// Helper function to build HTTP CONNECT request
 #[inline]
-fn empty_body() -> BoxBody<Bytes, hyper::Error> {
+fn build_http_connect_request(host: &str, port: u16, username: &Option<String>, password: &Option<String>) -> String {
+    use std::fmt::Write;
+    let mut req = String::with_capacity(256);
+    let _ = write!(&mut req, "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n", host, port, host, port);
+    
+    if let (Some(user), Some(pass)) = (username, password) {
+        use base64::Engine;
+        let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+        let _ = write!(&mut req, "Proxy-Authorization: Basic {}\r\n", credentials);
+    }
+    
+    let _ = write!(&mut req, "Proxy-Connection: Keep-Alive\r\n\r\n");
+    req
+}
+
+// Consolidated error response handler
+#[inline]
+fn handle_proxy_error(e: &ProxyError, is_connect: bool) -> Response<ProxyBody> {
+    let (status, msg) = match e {
+        ProxyError::InvalidUri(_) => (StatusCode::BAD_REQUEST, "Invalid URI"),
+        ProxyError::Io(_) | ProxyError::Socks(_) | ProxyError::Tls(_) => {
+            (StatusCode::BAD_GATEWAY, "Upstream Error")
+        }
+        _ if is_connect => (StatusCode::BAD_GATEWAY, "Upstream Error"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"),
+    };
+    error_response(status, msg)
+}
+
+#[inline]
+fn empty_body() -> ProxyBody {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
 }
 
 #[inline]
-fn error_response<E>(status: StatusCode, msg: &'static str) -> Response<BoxBody<Bytes, E>> {
-    let body = Full::new(Bytes::from_static(msg.as_bytes()))
-        .map_err(|never| -> E { match never {} })
-        .boxed();
+fn error_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody> {
+    let body = if msg.is_empty() {
+        empty_body()
+    } else {
+        Full::new(Bytes::from_static(msg.as_bytes()))
+            .map_err(|never| match never {})
+            .boxed()
+    };
     Response::builder()
         .status(status)
         .body(body)
@@ -661,27 +599,25 @@ fn error_response<E>(status: StatusCode, msg: &'static str) -> Response<BoxBody<
 
 pub async fn handle_client(
     stream: TcpStream,
-    _client_addr: SocketAddr,
     config: Arc<ProxyConfig>,
-) -> Result<(), ProxyError> {
+) -> ProxyResult<()> {
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
 
     let config_clone = Arc::clone(&config);
     let service = service_fn(move |req: Request<Incoming>| {
         let config = Arc::clone(&config_clone);
+        let is_connect = req.method() == Method::CONNECT;
         async move {
-            match handle_request(req, config).await {
+            let result = if is_connect {
+                handle_connect(req, config).await
+            } else {
+                handle_http(req, config).await
+            };
+            
+            match result {
                 Ok(resp) => Ok::<_, hyper::Error>(resp),
-                Err(e) => Ok(match e {
-                    ProxyError::InvalidUri(_) => {
-                        error_response(StatusCode::BAD_REQUEST, "Invalid URI")
-                    }
-                    ProxyError::Io(_) | ProxyError::Socks(_) | ProxyError::Tls(_) => {
-                        error_response(StatusCode::BAD_GATEWAY, "Upstream Error")
-                    }
-                    _ => error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"),
-                }),
+                Err(e) => Ok(handle_proxy_error(&e, is_connect)),
             }
         }
     });
@@ -695,22 +631,10 @@ pub async fn handle_client(
     Ok(())
 }
 
-#[inline]
-async fn handle_request(
-    req: Request<Incoming>,
-    config: Arc<ProxyConfig>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
-    if req.method() == Method::CONNECT {
-        handle_connect(req, config).await
-    } else {
-        handle_http(req, config).await
-    }
-}
-
 async fn handle_connect(
     req: Request<Incoming>,
     config: Arc<ProxyConfig>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
+) -> ProxyResult<Response<ProxyBody>> {
     let (host, port) = extract_host_port(req.uri())?;
 
     let host_clone = host.clone();
@@ -720,13 +644,11 @@ async fn handle_connect(
         match upgrade_fut.await {
             Ok(upgraded) => {
                 let upgraded_io = TokioIo::new(upgraded);
-                if let Err(e) = handle_tunnel(upgraded_io, &host_clone, port, config).await {
-                    eprintln!("Tunnel error for {}:{}: {}", host_clone, port, e);
+                if let Err(_e) = handle_tunnel(upgraded_io, &host_clone, port, config).await {
+                    eprintln!("Tunnel error for {}:{}", host_clone, port);
                 }
             }
-            Err(e) => {
-                eprintln!("Upgrade error for {}:{}: {}", host_clone, port, e);
-            }
+            Err(_) => {}
         }
     });
 
@@ -737,40 +659,16 @@ async fn handle_connect(
 }
 
 #[inline]
-fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
-    if let Some(host) = uri.host() {
-        let port = uri.port_u16().unwrap_or(443);
-        return Ok((host.to_string(), port));
-    }
-
-    if let Some(authority) = uri.authority() {
-        let auth_str = authority.as_str();
-        if auth_str.starts_with('[') {
-            if let Some(end_bracket) = auth_str.find(']') {
-                let host = &auth_str[1..end_bracket];
-                let rest = &auth_str[end_bracket + 1..];
-                if rest.starts_with(':') {
-                    if let Ok(port) = rest[1..].parse::<u16>() {
-                        return Ok((host.to_string(), port));
-                    }
-                }
-                return Ok((host.to_string(), 443));
-            }
-        }
-
-        if let Some(idx) = auth_str.rfind(':') {
-            let (host, port_str) = auth_str.split_at(idx);
-            if let Ok(port) = port_str[1..].parse::<u16>() {
-                return Ok((host.to_string(), port));
-            }
-        }
-        return Ok((auth_str.to_string(), 443));
-    }
-
-    Err(ProxyError::InvalidUri(Cow::Owned(format!(
-        "Missing host in URI: {}",
-        uri
-    ))))
+fn extract_host_port(uri: &Uri) -> ProxyResult<(String, u16)> {
+    let auth = uri.authority().ok_or_else(|| {
+        ProxyError::InvalidUri(Cow::Owned(format!("Missing authority in URI: {}", uri)))
+    })?;
+    let url = Url::parse(&format!("https://{}", auth.as_str()))
+        .map_err(|e| ProxyError::InvalidUri(Cow::Owned(e.to_string())))?;
+    Ok((
+        url.host_str().unwrap_or("").to_string(),
+        url.port().unwrap_or(443),
+    ))
 }
 
 async fn handle_tunnel<I>(
@@ -778,7 +676,7 @@ async fn handle_tunnel<I>(
     host: &str,
     port: u16,
     config: Arc<ProxyConfig>,
-) -> Result<(), ProxyError>
+) -> ProxyResult<()>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -798,12 +696,7 @@ where
         async move {
             match forward_request(req, &host, port, true, config).await {
                 Ok(resp) => Ok::<_, hyper::Error>(resp),
-                Err(e) => Ok(match e {
-                    ProxyError::InvalidUri(_) => {
-                        error_response(StatusCode::BAD_REQUEST, "Invalid URI")
-                    }
-                    _ => error_response(StatusCode::BAD_GATEWAY, "Upstream Error"),
-                }),
+                Err(e) => Ok(handle_proxy_error(&e, true)),
             }
         }
     });
@@ -820,13 +713,13 @@ where
 #[inline]
 fn strip_hop_by_hop_headers<T>(req: &mut Request<T>) {
     let headers = req.headers_mut();
-    headers.remove(header::CONNECTION);
+    headers.remove(CONNECTION);
     headers.remove("Proxy-Connection");
     headers.remove("Keep-Alive");
-    headers.remove(header::UPGRADE);
+    headers.remove(UPGRADE);
     headers.remove("TE");
     headers.remove("Trailer");
-    headers.remove(header::TRANSFER_ENCODING);
+    headers.remove(TRANSFER_ENCODING);
 }
 
 #[inline]
@@ -835,7 +728,7 @@ fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
         return false;
     }
 
-    let range_header = match req.headers().get(header::RANGE) {
+    let range_header = match req.headers().get(RANGE) {
         Some(h) => h,
         None => return false,
     };
@@ -877,7 +770,7 @@ fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
         Err(_) => return false,
     };
 
-    req.headers_mut().insert(header::RANGE, val);
+    req.headers_mut().insert(RANGE, val);
     true
 }
 
@@ -893,7 +786,7 @@ async fn forward_request(
     port: u16,
     is_tls: bool,
     config: Arc<ProxyConfig>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
+) -> ProxyResult<Response<ProxyBody>> {
     strip_hop_by_hop_headers(&mut req);
 
     if config.bypass_chunk_modification {
@@ -916,7 +809,6 @@ async fn forward_request(
 
     let (mut parts, body) = req.into_parts();
 
-
     if is_tls {
         let path_and_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
         parts.uri = Uri::builder()
@@ -927,12 +819,13 @@ async fn forward_request(
             .map_err(|e| ProxyError::InvalidUri(Cow::Owned(e.to_string())))?;
     }
 
-    parts.headers.insert(header::HOST, host_header);
+    parts.headers.insert(HOST, host_header);
 
     let req = Request::from_parts(parts, body);
     let resp = match sender.send_request(req).await {
         Ok(resp) => resp,
         Err(e) => {
+            // Connection is dead, don't return it to the pool
             abort_handle.abort();
             return Err(e.into());
         }
@@ -940,12 +833,16 @@ async fn forward_request(
 
     let (parts, incoming_body) = resp.into_parts();
 
+    if config.disable_pooling {
+        abort_handle.abort();
+        return Ok(Response::from_parts(parts, incoming_body.boxed()));
+    }
 
     let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
-        && parts.headers
-            .get(header::CONNECTION)
-            .map(|v| !v.as_bytes().eq_ignore_ascii_case(b"close"))
-            .unwrap_or(true);
+        && !matches!(
+            parts.headers.get(CONNECTION),
+            Some(v) if v.as_bytes().eq_ignore_ascii_case(b"close")
+        );
 
     if can_reuse {
         let body = BodyWithPoolReturn::new(
@@ -957,20 +854,17 @@ async fn forward_request(
             sender,
             abort_handle,
         );
-        Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
+        Ok(Response::from_parts(parts, body.boxed()))
     } else {
         abort_handle.abort();
-        Ok(Response::from_parts(
-            parts,
-            incoming_body.map_err(|e| e).boxed(),
-        ))
+        Ok(Response::from_parts(parts, incoming_body.boxed()))
     }
 }
 
 async fn handle_http(
     req: Request<Incoming>,
     config: Arc<ProxyConfig>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
+) -> ProxyResult<Response<ProxyBody>> {
     if (req.method() == Method::GET || req.method() == Method::HEAD) && req.uri().path() == "/" {
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -990,19 +884,6 @@ async fn handle_http(
 
 #[derive(Debug)]
 struct NoVerifier;
-
-static SUPPORTED_SIG_SCHEMES: &[rustls::SignatureScheme] = &[
-    rustls::SignatureScheme::RSA_PKCS1_SHA256,
-    rustls::SignatureScheme::RSA_PKCS1_SHA384,
-    rustls::SignatureScheme::RSA_PKCS1_SHA512,
-    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-    rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-    rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-    rustls::SignatureScheme::RSA_PSS_SHA256,
-    rustls::SignatureScheme::RSA_PSS_SHA384,
-    rustls::SignatureScheme::RSA_PSS_SHA512,
-    rustls::SignatureScheme::ED25519,
-];
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
@@ -1035,6 +916,17 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        SUPPORTED_SIG_SCHEMES.to_vec()
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }

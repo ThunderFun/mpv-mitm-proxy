@@ -9,6 +9,16 @@ use tokio::signal;
 use crate::certificate::CertificateAuthority;
 use crate::proxy::ProxyConfig;
 
+macro_rules! arg_parse {
+    ($args:expr, $flag:literal, $default:expr) => {
+        $args.iter()
+            .position(|a| a == $flag)
+            .and_then(|i| $args.get(i + 1))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or($default)
+    };
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -21,12 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let listen_port: u16 = args
-        .iter()
-        .position(|a| a == "--port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(12500);
+    let listen_port: u16 = arg_parse!(args, "--port", 12500);
 
     let upstream_proxy = args
         .iter()
@@ -37,9 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
     let bypass_chunk_modification = args.iter().any(|a| a == "--bypass-chunk-modification");
+    let disable_pooling = args.iter().any(|a| a == "--disable-pooling");
+    let verify_tls = args.iter().any(|a| a == "--verify-tls");
 
     let ca = Arc::new(CertificateAuthority::new()?);
-    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn, bypass_chunk_modification);
+    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn, bypass_chunk_modification, disable_pooling, verify_tls);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let listener = TcpListener::bind(addr).await?;
@@ -48,20 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, client_addr)) => {
-                        let config = Arc::clone(&config);
-                        tokio::spawn(async move {
-                            let _ = proxy::handle_client(stream, client_addr, config).await;
-                        });
-                    }
-                    Err(_) => {}
-                }
+            Ok((stream, _)) = listener.accept() => {
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    let _ = proxy::handle_client(stream, config).await;
+                });
             }
-            _ = signal::ctrl_c() => {
-                break;
-            }
+            _ = signal::ctrl_c() => break,
         }
     }
 

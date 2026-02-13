@@ -9,7 +9,9 @@ local opts = {
     fallback_to_direct = false,
     direct_cdn = false,
     ytdl_opts_fix = true,
-    bypass_chunk_modification = false
+    bypass_chunk_modification = false,
+    disable_pooling = false,
+    verify_tls = true
 }
 options.read_options(opts, "mitm_rust_proxy")
 
@@ -99,10 +101,35 @@ local function find_binary()
         script_dir .. "/mpv-mitm-proxy"
     }
     for _, path in ipairs(paths) do
-        local f = io.open(path, "r")
+        -- Use popen to check if file exists and is executable
+        local check_cmd = "test -x '" .. path .. "' 2>/dev/null && echo 'executable'"
+        local handle = io.popen(check_cmd)
+        local result = ""
+        if handle then
+            result = handle:read("*l") or ""
+            handle:close()
+        end
+        if result == "executable" then
+            return path
+        end
+        -- Fallback for Windows (check if file exists)
+        local f = io.open(path, "rb")
         if f then
             f:close()
-            return path
+            -- On Windows, also try running with .exe extension
+            if path:match("%.exe$") then
+                return path
+            end
+            -- For non-Windows, verify it's not a directory
+            local is_file = "test -f '" .. path .. "' 2>/dev/null && echo 'file'"
+            handle = io.popen(is_file)
+            if handle then
+                result = handle:read("*l") or ""
+                handle:close()
+                if result == "file" then
+                    return path
+                end
+            end
         end
     end
     mp.msg.error("No proxy binary found")
@@ -191,10 +218,12 @@ local function on_start_file()
     if not proxy_port then
         start_proxy_background()
     end
-    if proxy_port then
-        apply_proxy_settings()
+    -- If proxy still not started after attempt, return early
+    if not proxy_port then
+        return
     end
-    if proxy_ready or not proxy_port then
+    if proxy_ready then
+        apply_proxy_settings()
         return
     end
     
@@ -262,6 +291,12 @@ start_proxy_background = function()
     end
     if opts.bypass_chunk_modification then
         table.insert(args, "--bypass-chunk-modification")
+    end
+    if opts.disable_pooling then
+        table.insert(args, "--disable-pooling")
+    end
+    if opts.verify_tls then
+        table.insert(args, "--verify-tls")
     end
     proxy_port = port_attempt
     apply_proxy_settings()

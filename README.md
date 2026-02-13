@@ -10,6 +10,7 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 - **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
 - **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
 - **mpv Integration**: Includes a Lua script for seamless integration with the mpv media player.
+- **Connection Pooling**: Efficiently reuses connections for improved performance and reduced latency.
 - **Performance**: Built with Rust and Tokio for high performance and low resource usage.
 
 ## Prerequisites
@@ -53,12 +54,14 @@ The script supports several options that can be configured via `script-opts/mitm
 | Option | Default | Description |
 | :--- | :--- | :--- |
 | `use_proxies` | `false` | Enable or disable the use of upstream proxies. |
+| `proxy_rotation_enabled` | `false` | Enable proxy rotation when a proxy is blocked. |
 | `cooldown_hours` | `16` | How long to block a proxy after a bot challenge. |
 | `fallback_to_direct` | `false` | Use a direct connection if all proxies are blocked. |
-| `proxy_rotation_enabled` | `false` | Enable proxy rotation when a proxy is blocked. |
 | `direct_cdn` | `false` | Experimental: Use direct connection for CDN connections. |
 | `ytdl_opts_fix` | `true` | Apply a fix for some network errors. |
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
+| `disable_pooling` | `false` | Disable pooling. |
+| `verify_tls` | `true` | Verify TLS certificates from upstream servers. |
 
 Example command line usage:
 ```bash
