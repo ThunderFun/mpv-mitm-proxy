@@ -11,7 +11,7 @@ local opts = {
     ytdl_opts_fix = true,
     bypass_chunk_modification = false,
     disable_pooling = false,
-    verify_tls = true
+    verify_tls = false
 }
 options.read_options(opts, "mitm_rust_proxy")
 
@@ -21,11 +21,20 @@ local proxy_ready = false
 local script_dir = mp.get_script_directory() or "."
 local proxy_binary = "mpv-mitm-proxy"
 
+-- OS detection: package.config:sub(1,1) is '/' on Unix, '\\' on Windows
+local is_windows = package.config:sub(1, 1) == "\\"
+local path_sep = is_windows and "\\" or "/"
+
+local function join_path(...)
+    local parts = {...}
+    return table.concat(parts, path_sep)
+end
+
 local proxies = {}
 local current_proxy_index = 0
 local blocked_proxies = {}
-local proxy_file = script_dir .. "/proxies.txt"
-local cooldown_file = script_dir .. "/proxy_cooldowns.json"
+local proxy_file = join_path(script_dir, "proxies.txt")
+local cooldown_file = join_path(script_dir, "proxy_cooldowns.json")
 
 local function load_proxies()
     proxies = {}
@@ -95,38 +104,30 @@ end
 local function find_binary()
     local paths = {
         proxy_binary,
-        script_dir .. "/../proxy/" .. proxy_binary,
-        script_dir .. "/" .. proxy_binary,
-        script_dir .. "/mpv-mitm-proxy.exe",
-        script_dir .. "/mpv-mitm-proxy"
+        join_path(script_dir, "..", "proxy", proxy_binary),
+        join_path(script_dir, proxy_binary),
+        join_path(script_dir, "mpv-mitm-proxy.exe"),
+        join_path(script_dir, "mpv-mitm-proxy")
     }
+    
     for _, path in ipairs(paths) do
-        -- Use popen to check if file exists and is executable
-        local check_cmd = "test -x '" .. path .. "' 2>/dev/null && echo 'executable'"
-        local handle = io.popen(check_cmd)
-        local result = ""
-        if handle then
-            result = handle:read("*l") or ""
-            handle:close()
-        end
-        if result == "executable" then
-            return path
-        end
-        -- Fallback for Windows (check if file exists)
         local f = io.open(path, "rb")
         if f then
             f:close()
-            -- On Windows, also try running with .exe extension
-            if path:match("%.exe$") then
+            if is_windows then
+                if path:match("%.exe$") then
+                    return path
+                end
                 return path
-            end
-            -- For non-Windows, verify it's not a directory
-            local is_file = "test -f '" .. path .. "' 2>/dev/null && echo 'file'"
-            handle = io.popen(is_file)
-            if handle then
-                result = handle:read("*l") or ""
-                handle:close()
-                if result == "file" then
+            else
+                local check_cmd = "test -x '" .. path .. "' 2>/dev/null && test -f '" .. path .. "' 2>/dev/null && echo 'ok'"
+                local handle = io.popen(check_cmd)
+                local result = ""
+                if handle then
+                    result = handle:read("*l") or ""
+                    handle:close()
+                end
+                if result == "ok" then
                     return path
                 end
             end
@@ -137,10 +138,11 @@ local function find_binary()
 end
 
 local function check_port_open(port)
+    local null_dev = is_windows and "NUL" or "/dev/null"
     local res = mp.command_native({
         name = "subprocess",
         args = {
-            "curl", "-s", "-o", "/dev/null",
+            "curl", "-s", "-o", null_dev,
             "--max-time", "0.05",
             "--connect-timeout", "0.05",
             "http://127.0.0.1:" .. port .. "/"
