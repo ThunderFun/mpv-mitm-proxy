@@ -61,6 +61,7 @@ The script supports several options that can be configured via `script-opts/mitm
 | `ytdl_opts_fix` | `true` | Apply a fix for some network errors. |
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
 | `verify_tls` | `false` | Verify TLS certificates from upstream servers. |
+| `max_resolution` | `2160` | Maximum video height in pixels (e.g., 720, 1080, 1440, 2160). Only applies when `ytdl_opts_fix` is enabled. |
 
 Example command line usage:
 ```bash

@@ -10,7 +10,8 @@ local opts = {
     direct_cdn = false,
     ytdl_opts_fix = true,
     bypass_chunk_modification = false,
-    verify_tls = false
+    verify_tls = false,
+    max_resolution = 2160
 }
 options.read_options(opts, "mitm_rust_proxy")
 
@@ -108,7 +109,7 @@ local function find_binary()
         join_path(script_dir, "mpv-mitm-proxy.exe"),
         join_path(script_dir, "mpv-mitm-proxy")
     }
-    
+
     for _, path in ipairs(paths) do
         local f = io.open(path, "rb")
         if f then
@@ -164,7 +165,7 @@ local function apply_proxy_settings()
 
     local ytdl_opts
     if opts.ytdl_opts_fix then
-        ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=default,ios,-android_sdkless;formats=missing_pot",format="bv[protocol=m3u8_native]+ba[protocol=m3u8_native]/b[protocol=m3u8_native]"'
+        ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=default,ios,-android_sdkless;formats=missing_pot",format="bv[protocol=m3u8_native][height<=' .. opts.max_resolution .. ']+ba[protocol=m3u8_native]/b[protocol=m3u8_native]"'
     else
         ytdl_opts = "proxy=" .. px .. ",force-ipv4=,no-check-certificates=,"
     end
@@ -189,7 +190,7 @@ local function is_ytdl_applicable()
                       lower_path:find("youtu%.be") or
                       lower_path:find("googlevideo%.com") or
                       lower_path:find("ytimg%.com")
-    
+
     if not is_youtube then
         return false
     end
@@ -227,7 +228,7 @@ local function on_start_file()
         apply_proxy_settings()
         return
     end
-    
+
     local check_count = 0
     local function wait_ready()
         if proxy_ready then return end
@@ -315,7 +316,7 @@ start_proxy_background = function()
         proxy_ready = false
         mitm_job = nil
     end)
-    
+
     local check_count = 0
     local function wait_ready()
         if proxy_ready then return end
