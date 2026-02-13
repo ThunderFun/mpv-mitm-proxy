@@ -81,7 +81,7 @@ pub enum ProxyError {
 struct PooledConnection {
     sender: Option<SendRequest<Incoming>>,
     created_at: Instant,
-    abort_handle: Option<AbortHandle>,
+    abort_handle: AbortHandle,
 }
 
 impl PooledConnection {
@@ -90,19 +90,19 @@ impl PooledConnection {
     }
     
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
-        let sender = self.sender.take()?;
-        let abort_handle = self.abort_handle.take()?;
-        // Prevent Drop from running since we're taking ownership
-        std::mem::forget(self);
-        Some((sender, abort_handle))
+        self.sender.take().map(|sender| {
+            let handle = std::mem::replace(
+                &mut self.abort_handle,
+                tokio::task::spawn(async {}).abort_handle()
+            );
+            (sender, handle)
+        })
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        if let Some(handle) = self.abort_handle.take() {
-            handle.abort();
-        }
+        self.abort_handle.abort();
     }
 }
 
@@ -178,7 +178,7 @@ impl ConnectionPool {
         entry.value().lock().push(PooledConnection {
             sender: Some(sender),
             created_at: Instant::now(),
-            abort_handle: Some(abort_handle),
+            abort_handle,
         });
     }
 
@@ -273,12 +273,7 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        // If we still have a sender and abort_handle, the connection wasn't returned
-        // Try to return it to the pool instead of dropping it
-        if self.sender.is_some() && self.abort_handle.is_some() {
-            self.return_to_pool();
-        } else if let Some(handle) = self.abort_handle.take() {
-            // No sender but still have handle - abort it
+        if let Some(handle) = self.abort_handle.take() {
             handle.abort();
         }
     }
@@ -299,7 +294,8 @@ pub struct ProxyConfig {
     server_http1_builder: hyper::server::conn::http1::Builder,
     direct_cdn: bool,
     pub bypass_chunk_modification: bool,
-    disable_pooling: bool,
+    #[allow(dead_code)]
+    disable_pooling: bool,  // Kept for backward compatibility, ignored
     _verify_tls: bool,  // Stored for consistency, used during construction
 }
 
@@ -367,17 +363,15 @@ impl ProxyConfig {
         let mut server_http1_builder = hyper::server::conn::http1::Builder::new();
         configure_http1_builder(&mut client_http1_builder, &mut server_http1_builder);
 
-        // Only spawn cleanup task if pooling is enabled
-        if !disable_pooling {
-            let pool_clone = Arc::clone(&connection_pool);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    pool_clone.cleanup();
-                }
-            });
-        }
+        // Spawn cleanup task
+        let pool_clone = Arc::clone(&connection_pool);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                pool_clone.cleanup();
+            }
+        });
 
         Arc::new(Self {
             upstream_proxy,
@@ -516,13 +510,12 @@ impl ProxyConfig {
         port: u16,
         is_tls: bool,
     ) -> ProxyResult<(SendRequest<Incoming>, AbortHandle)> {
-        if !self.disable_pooling {
-            while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
-                match sender.ready().await {
-                    Ok(_) => return Ok((sender, abort_handle)),
-                    Err(_) => {
-                        abort_handle.abort();
-                    }
+        while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
+            match sender.ready().await {
+                Ok(_) => return Ok((sender, abort_handle)),
+                Err(_) => {
+                    abort_handle.abort();
+                    continue;
                 }
             }
         }
@@ -833,11 +826,6 @@ async fn forward_request(
 
     let (parts, incoming_body) = resp.into_parts();
 
-    if config.disable_pooling {
-        abort_handle.abort();
-        return Ok(Response::from_parts(parts, incoming_body.boxed()));
-    }
-
     let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
         && !matches!(
             parts.headers.get(CONNECTION),
@@ -857,7 +845,7 @@ async fn forward_request(
         Ok(Response::from_parts(parts, body.boxed()))
     } else {
         abort_handle.abort();
-        Ok(Response::from_parts(parts, incoming_body.boxed()))
+        Ok(Response::from_parts(parts, incoming_body.map_err(|e| e).boxed()))
     }
 }
 

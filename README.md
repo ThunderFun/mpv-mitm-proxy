@@ -60,7 +60,6 @@ The script supports several options that can be configured via `script-opts/mitm
 | `direct_cdn` | `false` | Experimental: Use direct connection for CDN connections. |
 | `ytdl_opts_fix` | `true` | Apply a fix for some network errors. |
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
-| `disable_pooling` | `false` | Disable pooling. |
 | `verify_tls` | `false` | Verify TLS certificates from upstream servers. |
 
 Example command line usage:

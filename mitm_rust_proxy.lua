@@ -10,7 +10,6 @@ local opts = {
     direct_cdn = false,
     ytdl_opts_fix = true,
     bypass_chunk_modification = false,
-    disable_pooling = false,
     verify_tls = false
 }
 options.read_options(opts, "mitm_rust_proxy")
@@ -293,9 +292,6 @@ start_proxy_background = function()
     end
     if opts.bypass_chunk_modification then
         table.insert(args, "--bypass-chunk-modification")
-    end
-    if opts.disable_pooling then
-        table.insert(args, "--disable-pooling")
     end
     if opts.verify_tls then
         table.insert(args, "--verify-tls")
