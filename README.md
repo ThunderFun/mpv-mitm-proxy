@@ -19,6 +19,11 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 - **Windows**: Visual C++ Redistributable (required for the pre-built binary)
 - (Optional) One or more upstream proxies
 
+## Supported Platforms
+
+- Linux
+- Windows
+
 ## Installation
 
 ### 1. Download or Build
