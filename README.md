@@ -53,7 +53,7 @@ https://proxy.example.com:8443
 ```
 
 ### Script Options
-The script supports several options that can be configured via `script-opts/mitm_rust_proxy.conf` or the command line:
+The following options are defined in the Lua script with default values. You can modify them directly in `mitm_rust_proxy.lua`, or override them via `script-opts/mitm_rust_proxy.conf` or the command line:
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
