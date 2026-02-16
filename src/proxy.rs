@@ -29,17 +29,17 @@ use crate::certificate::CertificateAuthority;
 fn root_certs() -> rustls::RootCertStore {
     let mut root_store = rustls::RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();
-    
+
     if let Some(e) = cert_result.errors.first() {
         eprintln!("Warning: some certificates failed to load: {}", e);
     }
-    
+
     for cert in cert_result.certs {
         if let Err(e) = root_store.add(cert) {
             eprintln!("Warning: failed to add certificate: {}", e);
         }
     }
-    
+
     root_store
 }
 
@@ -88,7 +88,7 @@ impl PooledConnection {
     fn is_valid(&self) -> bool {
         self.created_at.elapsed() < CONNECTION_TTL && self.sender.is_some()
     }
-    
+
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
         self.sender.take().map(|sender| {
             let handle = std::mem::replace(
@@ -153,7 +153,7 @@ impl ConnectionPool {
 
     fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
         let key: ConnKey = (host, port, is_tls);
-        
+
         {
             let mut state = self.state.lock();
             if state.1 >= CONNECTION_POOL_SIZE {
@@ -164,12 +164,12 @@ impl ConnectionPool {
                     }
                 }
             }
-            
+
             if state.1 >= CONNECTION_POOL_SIZE {
                 abort_handle.abort();
                 return;
             }
-            
+
             state.1 += 1;
             state.0.put(key.clone(), ());
         }
@@ -190,7 +190,7 @@ impl ConnectionPool {
             conns.retain(|conn| conn.is_valid());
             let after = conns.len();
             total_removed += before - after;
-            
+
             after != 0
         });
 
@@ -393,12 +393,12 @@ impl ProxyConfig {
         let host_owned = host.to_string();
         let connect_fut = async move {
             let use_direct = self_clone.direct_cdn && host_owned.ends_with("googlevideo.com");
-            
+
             match &self_clone.upstream_proxy {
                 Some(proxy) if !use_direct => {
                     let proxy_host = proxy.host.as_str();
                     let proxy_port = proxy.port;
-                    
+
                     match proxy.proxy_type {
                         ProxyType::Socks5 => {
                             let stream = match (&proxy.username, &proxy.password) {
@@ -424,12 +424,12 @@ impl ProxyConfig {
                             let _ = tcp_stream.set_nodelay(true);
 
                             let connect_req = build_http_connect_request(&host_owned, port, &proxy.username, &proxy.password);
-                            
+
                             tcp_stream.write_all(connect_req.as_bytes()).await?;
 
                             let mut buf = [0u8; 1024];
                             let mut pos = 0;
-                            
+
                             loop {
                                 let n = tcp_stream.read(&mut buf[pos..]).await?;
                                 if n == 0 {
@@ -439,7 +439,7 @@ impl ProxyConfig {
                                     )));
                                 }
                                 pos += n;
-                                
+
                                 static HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
                                 if pos >= 4 {
                                     let search_start = pos.saturating_sub(n + 3);
@@ -447,7 +447,7 @@ impl ProxyConfig {
                                         break;
                                     }
                                 }
-                                
+
                                 if pos >= buf.len() {
                                     return Err(ProxyError::Io(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
@@ -463,7 +463,7 @@ impl ProxyConfig {
                                     format!("HTTP proxy CONNECT failed: {}", String::from_utf8_lossy(first_line).trim()),
                                 )));
                             }
-                            
+
                             Ok(tcp_stream)
                         }
                     }
@@ -543,13 +543,13 @@ fn build_http_connect_request(host: &str, port: u16, username: &Option<String>, 
     use std::fmt::Write;
     let mut req = String::with_capacity(256);
     let _ = write!(&mut req, "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n", host, port, host, port);
-    
+
     if let (Some(user), Some(pass)) = (username, password) {
         use base64::Engine;
         let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
         let _ = write!(&mut req, "Proxy-Authorization: Basic {}\r\n", credentials);
     }
-    
+
     let _ = write!(&mut req, "Proxy-Connection: Keep-Alive\r\n\r\n");
     req
 }
@@ -607,7 +607,7 @@ pub async fn handle_client(
             } else {
                 handle_http(req, config).await
             };
-            
+
             match result {
                 Ok(resp) => Ok::<_, hyper::Error>(resp),
                 Err(e) => Ok(handle_proxy_error(&e, is_connect)),

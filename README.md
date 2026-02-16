@@ -5,7 +5,7 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 ## Features
 
 - **MITM Proxy**: Re-signs HTTPS traffic on the fly using an ephemeral internal CA.
-- **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments. ⚠️ *Note: Chunk modification may no longer be working.*
+- **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments.
 - **Optional Upstream Support**: Can connect to an upstream HTTP/HTTPS/SOCKS5 proxy if needed.
 - **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
 - **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
@@ -15,16 +15,19 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 
 ## Prerequisites
 
-- [Rust](https://www.rust-lang.org/) (latest stable)
 - [mpv](https://mpv.io/)
+- **Windows**: Visual C++ Redistributable (required for the pre-built binary)
 - (Optional) One or more upstream proxies
 
 ## Installation
 
 ### 1. Download or Build
 
+#### Download
+Pre-built binaries are available from the [releases page](https://github.com/ThunderFun/mpv-mitm-proxy/releases).
+
 #### Build
-If you prefer to build from source:
+If you prefer to build from source, you will need [Rust](https://www.rust-lang.org/) (latest stable):
 ```bash
 cargo build --release
 ```
@@ -41,10 +44,11 @@ Place both the binary (`mpv-mitm-proxy` or `mpv-mitm-proxy.exe`) and the Lua scr
 ## Configuration
 
 ### Proxy List (`proxies.txt`)
-Create a `proxies.txt` file in the same directory as the script. Add one SOCKS5 proxy URL per line:
+Create a `proxies.txt` file in the same directory as the script (included in release archives). Add one proxy URL per line. Supported proxy types: HTTP, HTTPS, and SOCKS5.
 ```text
 socks5://127.0.0.1:1080
-socks5://proxy.example.com:1080
+http://proxy.example.com:8080
+https://proxy.example.com:8443
 # Lines starting with # are ignored
 ```
 
@@ -58,10 +62,10 @@ The script supports several options that can be configured via `script-opts/mitm
 | `cooldown_hours` | `16` | How long to block a proxy after a bot challenge. |
 | `fallback_to_direct` | `false` | Use a direct connection if all proxies are blocked. |
 | `direct_cdn` | `false` | Experimental: Use direct connection for CDN connections. |
-| `ytdl_opts_fix` | `true` | Apply a fix for some network errors. |
+| `ytdl_extractor_profile` | `android_vr` | YouTube extractor profile to use (`android_vr`, `ios_m3u8`, or `basic`). |
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
 | `verify_tls` | `false` | Verify TLS certificates from upstream servers. |
-| `max_resolution` | `2160` | Maximum video height in pixels (e.g., 720, 1080, 1440, 2160). Only applies when `ytdl_opts_fix` is enabled. |
+| `max_resolution` | `2160` | Maximum video resolution for the `ios_m3u8` extractor profile. |
 
 Example command line usage:
 ```bash

@@ -8,7 +8,7 @@ local opts = {
     cooldown_hours = 16,
     fallback_to_direct = false,
     direct_cdn = false,
-    ytdl_opts_fix = true,
+    ytdl_extractor_profile = "android_vr",
     bypass_chunk_modification = false,
     verify_tls = false,
     max_resolution = 2160
@@ -163,10 +163,21 @@ local function apply_proxy_settings()
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
 
+    if opts.ytdl_opts_fix == false then
+        opts.ytdl_extractor_profile = "basic"
+    elseif opts.ytdl_opts_fix == true and opts.ytdl_extractor_profile == "ios_m3u8" then
+        opts.ytdl_extractor_profile = "android_vr"
+    end
+
     local ytdl_opts
-    if opts.ytdl_opts_fix then
-        ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=default,ios,-android_sdkless;formats=missing_pot",format="bv[protocol=m3u8_native][height<=' .. opts.max_resolution .. ']+ba[protocol=m3u8_native]/b[protocol=m3u8_native]"'
+    if opts.ytdl_extractor_profile == "ios_m3u8" then
+        -- iOS client with m3u8_native format selection
+        ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=ios,formats=missing_pot",format="bv[protocol=m3u8_native][height<=' .. opts.max_resolution .. ']+ba/b"'
+    elseif opts.ytdl_extractor_profile == "android_vr" then
+        -- android_vr client
+        ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=android_vr,-android_sdkless"'
     else
+        -- "basic" or any other value: minimal options only
         ytdl_opts = "proxy=" .. px .. ",force-ipv4=,no-check-certificates=,"
     end
 
