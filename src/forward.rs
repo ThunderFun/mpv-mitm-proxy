@@ -9,7 +9,7 @@ use hyper::body::Incoming;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::pool::{BodyWithPoolReturn, empty_body, ProxyBody, ProxyResult};
+use crate::pool::{BodyWithAbortHandle, BodyWithPoolReturn, empty_body, ProxyBody, ProxyResult};
 use crate::proxy::{ConnectionTarget, ProxyConfig, ProxyError};
 use crate::range::modify_youtube_range_headers;
 
@@ -108,7 +108,10 @@ pub async fn forward_request(
         );
         Ok(Response::from_parts(parts, body.boxed()))
     } else {
-        Ok(Response::from_parts(parts, incoming_body.map_err(|e| e).boxed()))
+        // Wrap body to keep abort_handle alive until body is consumed
+        // This prevents the connection from being aborted prematurely
+        let body = BodyWithAbortHandle::new(incoming_body, abort_handle);
+        Ok(Response::from_parts(parts, body.boxed()))
     }
 }
 

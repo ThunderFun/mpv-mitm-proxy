@@ -247,6 +247,70 @@ impl Drop for BodyWithPoolReturn {
     }
 }
 
+/// A body wrapper that keeps the abort_handle alive until the body is consumed.
+/// Used when pooling is disabled to prevent the connection from being aborted prematurely.
+pub struct BodyWithAbortHandle {
+    inner: Incoming,
+    abort_handle: Option<AbortHandle>,
+}
+
+impl BodyWithAbortHandle {
+    /// Creates a new BodyWithAbortHandle that will abort the connection task on error
+    /// or when dropped after the body is fully consumed.
+    pub fn new(inner: Incoming, abort_handle: AbortHandle) -> Self {
+        Self {
+            inner,
+            abort_handle: Some(abort_handle),
+        }
+    }
+}
+
+impl Body for BodyWithAbortHandle {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let inner = Pin::new(&mut self.inner);
+        match inner.poll_frame(cx) {
+            Poll::Ready(None) => {
+                // Body fully consumed, abort the connection task
+                if let Some(handle) = self.abort_handle.take() {
+                    handle.abort();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // Error occurred, abort the connection task
+                if let Some(handle) = self.abort_handle.take() {
+                    handle.abort();
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for BodyWithAbortHandle {
+    fn drop(&mut self) {
+        // Abort the connection task if not already aborted
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub fn empty_body() -> ProxyBody {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
