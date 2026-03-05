@@ -17,8 +17,8 @@ pub enum CertError {
     Generation(#[from] rcgen::Error),
     #[error("TLS configuration failed: {0}")]
     Tls(#[from] rustls::Error),
-    #[error("Lock error")]
-    Lock,
+    #[error("Lock error: {0}")]
+    Lock(&'static str),
 }
 
 struct CaData {
@@ -61,7 +61,7 @@ impl CertificateAuthority {
     }
 
     fn ensure_initialized(&self) -> Result<(), CertError> {
-        let mut ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+        let mut ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock("ca_data"))?;
         if ca_data_guard.is_some() {
             return Ok(());
         }
@@ -73,7 +73,7 @@ impl CertificateAuthority {
     pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
         // Fast path: check cache without generating
         {
-            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock("cache"))?;
             if let Some(config) = cache.get(hostname) {
                 return Ok(Arc::clone(config));
             }
@@ -87,7 +87,7 @@ impl CertificateAuthority {
 
         // Insert into cache, but check again in case another thread already inserted
         {
-            let mut cache = self.cache.lock().map_err(|_| CertError::Lock)?;
+            let mut cache = self.cache.lock().map_err(|_| CertError::Lock("cache"))?;
             // Use get_or_insert pattern to avoid redundant work
             if let Some(existing) = cache.get(hostname) {
                 return Ok(Arc::clone(existing));
@@ -99,7 +99,7 @@ impl CertificateAuthority {
     }
 
     fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
-        let ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock)?;
+        let ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock("ca_data"))?;
         let ca_data = ca_data_guard
             .as_ref()
             .ok_or_else(|| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?;

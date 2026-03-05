@@ -11,6 +11,7 @@ local opts = {
     ytdl_extractor_profile = "android_vr",
     bypass_chunk_modification = false,
     verify_tls = false,
+    disable_pooling = true,
     max_resolution = 2160
 }
 options.read_options(opts, "mitm_rust_proxy")
@@ -75,6 +76,28 @@ local function save_cooldowns()
         if success then f:write(json) end
         f:close()
     end
+end
+
+local function is_process_running(pid)
+    if not pid then return false end
+    if is_windows then
+        local check_cmd = 'tasklist /FI "PID eq ' .. pid .. '" /NH'
+        local handle = io.popen(check_cmd)
+        if handle then
+            local result = handle:read("*l") or ""
+            handle:close()
+            return result:find(tostring(pid)) ~= nil
+        end
+    else
+        local check_cmd = "kill -0 " .. pid .. " 2>/dev/null && echo 'running'"
+        local handle = io.popen(check_cmd)
+        if handle then
+            local result = handle:read("*l") or ""
+            handle:close()
+            return result == "running"
+        end
+    end
+    return false
 end
 
 local function get_next_proxy()
@@ -257,6 +280,7 @@ end
 
 start_proxy_background = function()
     if mitm_job then cleanup() end
+
     local bin = find_binary()
     if not bin then return end
 
@@ -308,6 +332,10 @@ start_proxy_background = function()
     if opts.verify_tls then
         table.insert(args, "--verify-tls")
     end
+    if opts.disable_pooling then
+        table.insert(args, "--disable-pooling")
+    end
+
     proxy_port = port_attempt
     apply_proxy_settings()
     mitm_job = mp.command_native_async({

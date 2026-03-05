@@ -26,6 +26,7 @@ time = "0.3"
 parking_lot = "0.12"
 http-body = "1.0"
 
+
 [profile.release]
 lto = true
 codegen-units = 1

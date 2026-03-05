@@ -70,6 +70,7 @@ The following options are defined in the Lua script with default values. You can
 | `ytdl_extractor_profile` | `android_vr` | YouTube extractor profile to use (`android_vr`, `ios_m3u8`, or `basic`). |
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
 | `verify_tls` | `false` | Verify TLS certificates from upstream servers. |
+| `disable_pooling` |  `true` | Disable pooling. |
 | `max_resolution` | `2160` | Maximum video resolution for the `ios_m3u8` extractor profile. |
 
 Example command line usage:
