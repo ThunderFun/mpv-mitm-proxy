@@ -1,4 +1,28 @@
+//! Certificate Authority module for TLS interception.
+//!
+//! This module provides dynamic generation of SSL/TLS certificates for HTTPS interception,
+//! enabling the proxy to terminate and re-encrypt TLS connections. It implements a
+//! certificate authority that can generate per-host certificates signed by a trusted root.
+//!
+//! # Key Components
+//!
+//! - `CertificateAuthority`: The main CA structure that generates and caches server certificates
+//! - `CertError`: Error type for certificate generation failures
+//!
+//! # Features
+//!
+//! - In-memory LRU cache to avoid regenerating certificates for the same hostname
+//! - ECDSA P-256 key generation for modern compatibility
+//! - 30-day validity period for generated certificates
+//! - 10-year validity for the root CA certificate
+//!
+//! # Security Considerations
+//!
+//! The generated CA certificate is ephemeral (created in-memory on startup).
+//! For production use, the CA certificate should be persisted and securely stored.
+
 use lru::LruCache;
+use parking_lot::Mutex;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
@@ -6,7 +30,7 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -17,8 +41,6 @@ pub enum CertError {
     Generation(#[from] rcgen::Error),
     #[error("TLS configuration failed: {0}")]
     Tls(#[from] rustls::Error),
-    #[error("Lock error: {0}")]
-    Lock(&'static str),
 }
 
 struct CaData {
@@ -60,23 +82,40 @@ impl CertificateAuthority {
         })
     }
 
+    /// Ensures the CA data is initialized, generating it if necessary.
+    /// Uses a closure-based pattern to minimize lock duration.
     fn ensure_initialized(&self) -> Result<(), CertError> {
-        let mut ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock("ca_data"))?;
-        if ca_data_guard.is_some() {
+        // Quick check without mutation
+        if self.ca_data.lock().is_some() {
             return Ok(());
         }
+
+        // Need to generate - do work outside the lock
         let ca_data = Self::generate_ca()?;
-        *ca_data_guard = Some(ca_data);
+        *self.ca_data.lock() = Some(ca_data);
         Ok(())
+    }
+
+    /// Looks up a cached server config for the given hostname.
+    fn get_cached_config(&self, hostname: &str) -> Option<Arc<ServerConfig>> {
+        self.cache.lock().get(hostname).cloned()
+    }
+
+    /// Inserts a config into the cache, returning the cached value if one already exists.
+    fn insert_config(&self, hostname: &str, config: Arc<ServerConfig>) -> Arc<ServerConfig> {
+        let mut cache = self.cache.lock();
+        // Check again in case another thread inserted while we were generating
+        if let Some(existing) = cache.get(hostname) {
+            return Arc::clone(existing);
+        }
+        cache.put(hostname.to_string(), Arc::clone(&config));
+        config
     }
 
     pub fn get_server_config(&self, hostname: &str) -> Result<Arc<ServerConfig>, CertError> {
         // Fast path: check cache without generating
-        {
-            let mut cache = self.cache.lock().map_err(|_| CertError::Lock("cache"))?;
-            if let Some(config) = cache.get(hostname) {
-                return Ok(Arc::clone(config));
-            }
+        if let Some(config) = self.get_cached_config(hostname) {
+            return Ok(config);
         }
 
         self.ensure_initialized()?;
@@ -85,22 +124,13 @@ impl CertificateAuthority {
         let config = self.generate_server_config(hostname)?;
         let config = Arc::new(config);
 
-        // Insert into cache, but check again in case another thread already inserted
-        {
-            let mut cache = self.cache.lock().map_err(|_| CertError::Lock("cache"))?;
-            // Use get_or_insert pattern to avoid redundant work
-            if let Some(existing) = cache.get(hostname) {
-                return Ok(Arc::clone(existing));
-            }
-            cache.put(hostname.to_string(), Arc::clone(&config));
-        }
-
-        Ok(config)
+        // Insert with race-condition check
+        Ok(self.insert_config(hostname, config))
     }
 
     fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
-        let ca_data_guard = self.ca_data.lock().map_err(|_| CertError::Lock("ca_data"))?;
-        let ca_data = ca_data_guard
+        let ca_data = self.ca_data.lock();
+        let ca_data = ca_data
             .as_ref()
             .ok_or_else(|| CertError::Generation(rcgen::Error::CouldNotParseCertificate))?;
 

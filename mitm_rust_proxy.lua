@@ -19,6 +19,7 @@ options.read_options(opts, "mitm_rust_proxy")
 local mitm_job = nil
 local proxy_port = nil
 local proxy_ready = false
+local proxy_starting = false
 local script_dir = mp.get_script_directory() or "."
 local proxy_binary = "mpv-mitm-proxy"
 
@@ -121,6 +122,7 @@ local function cleanup()
         mitm_job = nil
     end
     proxy_ready = false
+    proxy_starting = false
     proxy_port = nil
 end
 
@@ -166,8 +168,8 @@ local function check_port_open(port)
         name = "subprocess",
         args = {
             "curl", "-s", "-o", null_dev,
-            "--max-time", "0.05",
-            "--connect-timeout", "0.05",
+            "--max-time", "1.0",
+            "--connect-timeout", "0.5",
             "http://127.0.0.1:" .. port .. "/"
         },
         capture_stdout = false,
@@ -242,7 +244,7 @@ local function on_load_hook()
     if not is_ytdl_applicable() then
         return
     end
-    if not proxy_port then
+    if not proxy_port and not proxy_starting then
         start_proxy_background()
     end
 end
@@ -251,38 +253,33 @@ local function on_start_file()
     if not is_ytdl_applicable() then
         return
     end
-    if not proxy_port then
+
+    -- Start proxy if needed - this blocks until proxy is ready
+    if not proxy_port and not proxy_starting then
         start_proxy_background()
     end
-    -- If proxy still not started after attempt, return early
-    if not proxy_port then
-        return
-    end
+
+    -- Apply settings if proxy is ready
     if proxy_ready then
         apply_proxy_settings()
-        return
+    elseif not proxy_port then
+        mp.msg.warn("Proxy not available, proceeding without proxy")
     end
-
-    local check_count = 0
-    local function wait_ready()
-        if proxy_ready then return end
-        if proxy_port and check_port_open(proxy_port) then
-            proxy_ready = true
-            mp.msg.info("Proxy ready on port " .. proxy_port)
-            apply_proxy_settings()
-        elseif check_count < 20 then
-            check_count = check_count + 1
-            mp.add_timeout(0.1, wait_ready)
-        end
-    end
-    wait_ready()
 end
 
 start_proxy_background = function()
+    -- Guard against concurrent startup attempts
+    if proxy_starting then
+        mp.msg.debug("Proxy startup already in progress, skipping duplicate request")
+        return
+    end
     if mitm_job then cleanup() end
 
     local bin = find_binary()
     if not bin then return end
+
+    proxy_starting = true
+    mp.msg.info("Starting proxy...")
 
     -- Check if binary is executable and works
     local test_res = mp.command_native({
@@ -300,6 +297,7 @@ start_proxy_background = function()
         mp.msg.error(string.format("[mpv_mitm_proxy] Subprocess failed: init (error: %s, status: %s)", err, status))
         if stdout ~= "" then mp.msg.error("Stdout: " .. stdout) end
         if stderr ~= "" then mp.msg.error("Stderr: " .. stderr) end
+        proxy_starting = false
         return
     end
 
@@ -311,11 +309,13 @@ start_proxy_background = function()
                 mp.osd_message("All proxies are blocked!", 5)
             end
             if not opts.fallback_to_direct then
+                proxy_starting = false
                 return
             end
         end
     end
-    math.randomseed(os.time())
+
+    math.randomseed(os.time() + math.random(1, 1000))
     local port_attempt = math.random(15000, 25000)
     local args = {bin, "--port", tostring(port_attempt)}
     if upstream then
@@ -336,8 +336,8 @@ start_proxy_background = function()
         table.insert(args, "--disable-pooling")
     end
 
-    proxy_port = port_attempt
-    apply_proxy_settings()
+    -- Start proxy asynchronously
+    local pending_port = port_attempt
     mitm_job = mp.command_native_async({
         name = "subprocess",
         args = args,
@@ -353,22 +353,49 @@ start_proxy_background = function()
             mp.msg.error(err_msg)
         end
         proxy_ready = false
+        proxy_starting = false
         mitm_job = nil
     end)
 
+    -- Wait for proxy using synchronous polling with small delays
+    -- Note: mpv Lua is single-threaded, async callbacks run when we yield
     local check_count = 0
-    local function wait_ready()
-        if proxy_ready then return end
-        if check_port_open(port_attempt) then
+    local max_wait = 100  -- 5 seconds total
+
+    while check_count < max_wait do
+        -- Check if proxy is ready
+        if check_port_open(pending_port) then
+            proxy_port = pending_port
             proxy_ready = true
-            mp.msg.info("Proxy ready on port " .. port_attempt)
+            proxy_starting = false
+            mp.msg.info("Proxy ready on port " .. pending_port)
             apply_proxy_settings()
-        elseif check_count < 20 then
-            check_count = check_count + 1
-            mp.add_timeout(0.1, wait_ready)
+            return
         end
+
+        -- Check if subprocess exited early (callback runs when we yield)
+        if mitm_job == nil then
+            mp.msg.error("Proxy subprocess exited unexpectedly during startup")
+            proxy_starting = false
+            cleanup()
+            return
+        end
+
+        -- Small delay using mp.command_native with subprocess
+        -- This yields control and allows async callbacks to run
+        mp.command_native({
+            name = "subprocess",
+            args = {"sleep", "0.05"},
+            playback_only = false
+        })
+
+        check_count = check_count + 1
     end
-    wait_ready()
+
+    -- Timeout
+    mp.msg.error("Timeout waiting for proxy to start on port " .. pending_port)
+    proxy_starting = false
+    cleanup()
 end
 
 local function rotate_proxy()

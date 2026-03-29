@@ -9,9 +9,31 @@ use hyper::body::Incoming;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::pool::{BodyWithAbortHandle, BodyWithPoolReturn, empty_body, ProxyBody, ProxyResult};
-use crate::proxy::{ConnectionTarget, ProxyConfig, ProxyError};
+use crate::pool::{BodyWithAbortHandle, BodyWithPoolReturn, empty_body, ProxyBody};
+use crate::types::{ConnectionTarget, ProxyError, ProxyResult};
 use crate::range::modify_youtube_range_headers;
+
+/// Trait for types that can provide connections.
+/// Used to break circular dependencies between proxy and forward modules.
+pub trait ConnectionProvider: Send + Sync {
+    /// Gets or creates a connection to the target.
+    fn get_or_create_connection(
+        &self,
+        target: &ConnectionTarget,
+    ) -> impl std::future::Future<Output = ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)>> + Send;
+
+    /// Returns the connection pool.
+    fn connection_pool(&self) -> Arc<crate::pool::ConnectionPool>;
+
+    /// Whether chunk modification is bypassed.
+    fn bypass_chunk_modification(&self) -> bool;
+
+    /// Whether pooling is disabled.
+    fn disable_pooling(&self) -> bool;
+
+    /// Returns the certificate authority for TLS interception.
+    fn ca(&self) -> Arc<crate::certificate::CertificateAuthority>;
+}
 
 /// Strips hop-by-hop headers that should not be forwarded.
 ///
@@ -42,15 +64,18 @@ pub fn strip_hop_by_hop_headers<T>(req: &mut Request<T>) {
 /// # Arguments
 /// * `req` - The incoming HTTP request
 /// * `target` - The target connection specification (host, port, TLS)
-/// * `config` - The proxy configuration
-pub async fn forward_request(
+/// * `provider` - Something that can provide connections
+pub async fn forward_request<P>(
     mut req: Request<Incoming>,
     target: &ConnectionTarget,
-    config: Arc<ProxyConfig>,
-) -> ProxyResult<Response<ProxyBody>> {
+    provider: Arc<P>,
+) -> ProxyResult<Response<ProxyBody>>
+where
+    P: ConnectionProvider,
+{
     strip_hop_by_hop_headers(&mut req);
 
-    if config.bypass_chunk_modification {
+    if provider.bypass_chunk_modification() {
         if target.host.ends_with("googlevideo.com") {
             println!("[PROXY] Bypassing chunk modification for {}", target.host);
         }
@@ -58,7 +83,7 @@ pub async fn forward_request(
         println!("[PROXY] Modified Range header for {}", target.host);
     }
 
-    let (mut sender, abort_handle) = config.get_or_create_connection(target).await?;
+    let (mut sender, abort_handle) = provider.get_or_create_connection(target).await?;
 
     let host_header = if target.port == target.default_port() {
         http::HeaderValue::from_str(&target.host)
@@ -98,10 +123,10 @@ pub async fn forward_request(
             Some(v) if v.as_bytes().eq_ignore_ascii_case(b"close")
         );
 
-    if can_reuse && !config.disable_pooling {
+    if can_reuse && !provider.disable_pooling() {
         let body = BodyWithPoolReturn::new(
             incoming_body,
-            Arc::clone(&config.connection_pool),
+            provider.connection_pool(),
             target.clone(),
             sender,
             abort_handle,
@@ -122,11 +147,14 @@ pub async fn forward_request(
 ///
 /// # Arguments
 /// * `req` - The incoming HTTP request
-/// * `config` - The proxy configuration
-pub async fn handle_http(
+/// * `provider` - Something that can provide connections
+pub async fn handle_http<P>(
     req: Request<Incoming>,
-    config: Arc<ProxyConfig>,
-) -> ProxyResult<Response<ProxyBody>> {
+    provider: Arc<P>,
+) -> ProxyResult<Response<ProxyBody>>
+where
+    P: ConnectionProvider,
+{
     if (req.method() == Method::GET || req.method() == Method::HEAD) && req.uri().path() == "/" {
         return Ok(Response::builder()
             .status(StatusCode::OK)
@@ -142,5 +170,5 @@ pub async fn handle_http(
     let port = uri.port_u16().unwrap_or(80);
     let target = ConnectionTarget { host, port, is_tls: false };
 
-    forward_request(req, &target, config).await
+    forward_request(req, &target, provider).await
 }

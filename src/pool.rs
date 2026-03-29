@@ -12,14 +12,12 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 
-use crate::proxy::ProxyError;
+use crate::types::ConnectionTarget;
 
-pub const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 pub const CONNECTION_POOL_SIZE: usize = 100;
 pub const CONNECTION_TTL: Duration = Duration::from_secs(60);
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
-pub type ProxyResult<T> = Result<T, ProxyError>;
 
 pub struct PooledConnection {
     sender: Option<SendRequest<Incoming>>,
@@ -171,7 +169,7 @@ impl ConnectionPool {
 pub struct BodyWithPoolReturn {
     inner: Incoming,
     pool: Arc<ConnectionPool>,
-    target: Option<crate::proxy::ConnectionTarget>,
+    target: Option<ConnectionTarget>,
     sender: Option<SendRequest<Incoming>>,
     abort_handle: Option<AbortHandle>,
 }
@@ -181,7 +179,7 @@ impl BodyWithPoolReturn {
     pub fn new(
         inner: Incoming,
         pool: Arc<ConnectionPool>,
-        target: crate::proxy::ConnectionTarget,
+        target: ConnectionTarget,
         sender: SendRequest<Incoming>,
         abort_handle: AbortHandle,
     ) -> Self {
@@ -329,4 +327,22 @@ pub fn error_response(status: http::StatusCode, msg: &'static str) -> http::Resp
         .status(status)
         .body(body)
         .expect("valid response")
+}
+
+/// Consolidated error response handler for proxy errors.
+/// Maps ProxyError variants to appropriate HTTP status codes and messages.
+#[inline]
+pub fn handle_proxy_error(e: &crate::types::ProxyError, is_connect: bool) -> http::Response<ProxyBody> {
+    use crate::types::ProxyError;
+    use http::StatusCode;
+
+    let (status, msg) = match e {
+        ProxyError::InvalidUri(_) => (StatusCode::BAD_REQUEST, "Invalid URI"),
+        ProxyError::Io(_) | ProxyError::Socks(_) | ProxyError::Tls(_) => {
+            (StatusCode::BAD_GATEWAY, "Upstream Error")
+        }
+        _ if is_connect => (StatusCode::BAD_GATEWAY, "Upstream Error"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"),
+    };
+    error_response(status, msg)
 }

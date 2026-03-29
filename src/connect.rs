@@ -8,12 +8,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 
-use crate::proxy::{ProxyConfig, ProxyError, ProxyType};
+use crate::types::{ConnectionConfig, ProxyError, ProxyType, UpstreamProxy};
 
 /// Establishes a connection to the target host via an upstream proxy if configured.
 /// Returns a TcpStream ready for use.
 pub async fn connect_via_proxy(
-    config: &ProxyConfig,
+    config: &ConnectionConfig,
     host: &str,
     port: u16,
 ) -> Result<TcpStream, ProxyError> {
@@ -43,7 +43,7 @@ async fn connect_direct(host: &str, port: u16) -> Result<TcpStream, ProxyError> 
 
 /// Connects via SOCKS5 proxy.
 async fn connect_via_socks5(
-    proxy: &crate::proxy::UpstreamProxy,
+    proxy: &UpstreamProxy,
     host: &str,
     port: u16,
 ) -> Result<TcpStream, ProxyError> {
@@ -68,7 +68,7 @@ async fn connect_via_socks5(
 
 /// Connects via HTTP proxy using CONNECT method.
 async fn connect_via_http_proxy(
-    proxy: &crate::proxy::UpstreamProxy,
+    proxy: &UpstreamProxy,
     host: &str,
     port: u16,
 ) -> Result<TcpStream, ProxyError> {

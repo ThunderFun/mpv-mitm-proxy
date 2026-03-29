@@ -1,4 +1,25 @@
+//! TLS configuration and certificate verification module.
+//!
+//! This module provides functionality for loading system root certificates and
+//! configuring TLS verification behaviors for both client and server connections.
+//!
+//! # Key Components
+//!
+//! - `root_certs()`: Loads the system's native root certificate store
+//! - `NoVerifier`: A permissive certificate verifier that accepts all certificates
+//!   (intended for debugging or specialized use cases only)
+//!
+//! # Security Warning
+//!
+//! The `NoVerifier` type disables all certificate validation and should only be
+//! used in controlled testing environments or when connecting to known-good
+//! endpoints where certificate verification is handled at a different layer.
+//! Never use `NoVerifier` in production without understanding the security implications.
+
 /// Load root certificates from the system for TLS verification.
+///
+/// Uses rustls-native-certs to load the platform's native certificate store.
+/// Falls back gracefully if some certificates fail to load.
 pub fn root_certs() -> rustls::RootCertStore {
     let mut root_store = rustls::RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();

@@ -1,12 +1,18 @@
+//! MPV MITM Proxy - HTTP/HTTPS proxy with connection pooling and TLS interception.
+//!
+//! A high-performance async HTTP proxy built with Tokio and Hyper.
+//! Supports upstream proxy chaining (HTTP CONNECT and SOCKS5), connection pooling,
+//! and dynamic TLS certificate generation for HTTPS interception.
+
 mod certificate;
 mod connect;
 mod forward;
-mod handlers;
 mod pool;
 mod proxy;
 mod range;
 mod tls;
 mod tunnel;
+mod types;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 
 use crate::certificate::CertificateAuthority;
-use crate::proxy::ProxyConfig;
+use crate::proxy::{handle_client, ProxyConfig};
 
 macro_rules! arg_parse {
     ($args:expr, $flag:literal, $default:expr) => {
@@ -34,9 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    if let Err(_e) = rustls::crypto::ring::default_provider().install_default() {
+        return Err("Failed to install rustls crypto provider: provider already initialized".into());
+    }
 
     let listen_port: u16 = arg_parse!(args, "--port", 12500);
     let auto_port = args.iter().any(|a| a == "--auto-port");
@@ -98,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((stream, _)) = listener.accept() => {
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    let _ = proxy::handle_client(stream, config).await;
+                    let _ = handle_client(stream, config).await;
                 });
             }
             _ = signal::ctrl_c() => {

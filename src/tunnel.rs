@@ -13,15 +13,18 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 
-use crate::pool::{empty_body, ProxyBody, ProxyResult};
-use crate::proxy::{handle_proxy_error, ConnectionTarget, ProxyConfig, ProxyError};
-use crate::forward::forward_request;
+use crate::pool::{empty_body, ProxyBody, handle_proxy_error};
+use crate::types::{ConnectionTarget, ProxyError, ProxyResult};
+use crate::forward::{forward_request, ConnectionProvider};
 
 /// Handles HTTP CONNECT requests to establish a TLS tunnel.
-pub async fn handle_connect(
+pub async fn handle_connect<P>(
     req: Request<Incoming>,
-    config: Arc<ProxyConfig>,
-) -> ProxyResult<Response<ProxyBody>> {
+    config: Arc<P>,
+) -> ProxyResult<Response<ProxyBody>>
+where
+    P: ConnectionProvider + 'static,
+{
     let (host, port) = extract_host_port(req.uri())?;
 
     let host_clone = host.clone();
@@ -69,19 +72,20 @@ pub fn extract_host_port(uri: &http::Uri) -> ProxyResult<(String, u16)> {
 ///
 /// After a successful HTTP CONNECT, performs TLS handshake
 /// and serves HTTP requests over the encrypted tunnel.
-pub async fn handle_tunnel<I>(
+pub async fn handle_tunnel<I, P>(
     upgraded: I,
     host: &str,
     port: u16,
-    config: Arc<ProxyConfig>,
+    config: Arc<P>,
 ) -> ProxyResult<()>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    P: ConnectionProvider + 'static,
 {
     let tls_config = config
-        .ca
+        .ca()
         .get_server_config(host)
-        .map_err(|e| ProxyError::Certificate(e.to_string()))?;
+        .map_err(ProxyError::Certificate)?;
 
     let acceptor = TlsAcceptor::from(tls_config);
     let client_tls = acceptor.accept(upgraded).await?;

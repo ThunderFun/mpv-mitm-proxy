@@ -5,11 +5,33 @@
 
 use http::{header::RANGE, Request};
 
-use crate::pool::CHUNK_SIZE;
+/// Size of streaming chunks for range requests (10 MB).
+/// Used for YouTube optimization to request fixed-size byte ranges
+/// instead of open-ended ranges, improving streaming performance.
+pub const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Parses a byte range header value in the format "bytes=start-" (open-ended).
-/// Returns Some(start_byte) on success, None if parsing fails or format is invalid.
+///
+/// This parser handles the specific format used by YouTube's streaming requests,
+/// which use open-ended byte ranges (e.g., "bytes=0-" or "bytes=1048576-").
+///
+/// # Format
+/// - Must start with "bytes=" (6 bytes)
+/// - Followed by one or more ASCII digits
+/// - Must end with "-" (hyphen)
+/// - No additional hyphens allowed in the start byte
+///
+/// # Returns
+/// - `Some(start_byte)` - The parsed start byte position on success
+/// - `None` - If the format is invalid, contains non-digit characters, or would overflow
+///
+/// # Examples
+/// - `"bytes=0-"` → `Some(0)`
+/// - `"bytes=1048576-"` → `Some(1048576)`
+/// - `"bytes=0-100"` → `None` (closed range not supported)
+/// - `"bytes=-100"` → `None` (missing start byte)
 pub fn parse_open_ended_range(range_bytes: &[u8]) -> Option<u64> {
+    // Minimum valid format: "bytes=0-" = 8 bytes
     if range_bytes.len() < 8
         || !range_bytes.starts_with(b"bytes=")
         || !range_bytes.ends_with(b"-")
@@ -17,22 +39,25 @@ pub fn parse_open_ended_range(range_bytes: &[u8]) -> Option<u64> {
         return None;
     }
 
+    // Extract the digits between "bytes=" and the trailing "-"
     let start_bytes = &range_bytes[6..range_bytes.len() - 1];
     if start_bytes.is_empty() || start_bytes.contains(&b'-') {
         return None;
     }
 
+    // Parse the start byte value digit by digit with overflow protection
     let mut start_byte: u64 = 0;
     for &b in start_bytes {
         if !b.is_ascii_digit() {
             return None;
         }
+        // Safely accumulate: new = old * 10 + digit
         start_byte = match start_byte
             .checked_mul(10)
             .and_then(|n| n.checked_add((b - b'0') as u64))
         {
             Some(n) => n,
-            None => return None,
+            None => return None, // Overflow occurred
         };
     }
 

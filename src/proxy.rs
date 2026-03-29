@@ -1,21 +1,25 @@
-use http::{Method, Request, StatusCode};
+use http::{Method, Request};
+use std::borrow::Cow;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::net::TcpStream;
 use url::Url;
 
 use crate::certificate::CertificateAuthority;
-use crate::pool::{ConnectionPool, ProxyBody, ProxyResult};
+use crate::connect::connect_via_proxy;
+use crate::forward::ConnectionProvider;
+use crate::pool::{ConnectionPool, handle_proxy_error};
 use crate::tls::{root_certs, NoVerifier};
 
-pub use crate::forward::handle_http;
-pub use crate::tunnel::handle_connect;
-pub use crate::pool::error_response;
+// Public API types - imported by consumers
+pub use crate::types::{ConnectionConfig, ConnectionTarget, ProxyError, ProxyResult, ProxyType, UpstreamProxy};
+
+// Internal handlers - not publicly re-exported
+use crate::forward::handle_http;
+use crate::tunnel::handle_connect;
 
 #[inline]
 pub fn configure_http1_builder(
@@ -24,32 +28,6 @@ pub fn configure_http1_builder(
 ) {
     client.preserve_header_case(true).title_case_headers(true);
     server.preserve_header_case(true).title_case_headers(true);
-}
-
-#[derive(Error, Debug)]
-pub enum ProxyError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Hyper error: {0}")]
-    Hyper(#[from] hyper::Error),
-    #[error("HTTP error: {0}")]
-    Http(#[from] http::Error),
-    #[error("Invalid URI: {0}")]
-    InvalidUri(Cow<'static, str>),
-    #[error("TLS error: {0}")]
-    Tls(#[from] rustls::Error),
-    #[error("Certificate error: {0}")]
-    Certificate(String),
-    #[error("SOCKS error: {0}")]
-    Socks(#[from] tokio_socks::Error),
-    #[error("URL parse error: {0}")]
-    UrlParse(#[from] url::ParseError),
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum ProxyType {
-    Socks5,
-    Http,
 }
 
 pub struct ProxyConfig {
@@ -62,37 +40,100 @@ pub struct ProxyConfig {
     pub direct_cdn: bool,
     pub bypass_chunk_modification: bool,
     pub disable_pooling: bool,
-    _verify_tls: bool,
+    /// Whether TLS certificate verification is enabled.
+    /// Kept for potential future features like debug logging, CLI inspection,
+    /// or runtime configuration changes.
+    pub verify_tls: bool,
 }
 
-/// Upstream proxy configuration.
-pub struct UpstreamProxy {
-    pub proxy_type: ProxyType,
-    pub host: String,
-    pub port: u16,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
+impl ConnectionProvider for ProxyConfig {
+    async fn get_or_create_connection(
+        &self,
+        target: &ConnectionTarget,
+    ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)> {
+        // Try to reuse connection from pool only if pooling is enabled
+        if !self.disable_pooling {
+            while let Some((mut sender, abort_handle)) = self.connection_pool.get(&target.host, target.port, target.is_tls) {
+                match sender.ready().await {
+                    Ok(_) => return Ok((sender, abort_handle)),
+                    Err(_) => {
+                        abort_handle.abort();
+                        continue;
+                    }
+                }
+            }
+        }
 
-/// Target connection specification for proxy connections.
-#[derive(Clone, Debug)]
-pub struct ConnectionTarget {
-    /// Target hostname or IP address
-    pub host: String,
-    /// Target port (e.g., 80 for HTTP, 443 for HTTPS)
-    pub port: u16,
-    /// Whether to use TLS encryption
-    pub is_tls: bool,
-}
+        // Establish new connection
+        let conn_config = self.connection_config();
+        let connect_fut = connect_via_proxy(&conn_config, &target.host, target.port);
 
-impl ConnectionTarget {
-    /// Returns the default port for the connection type
-    pub fn default_port(&self) -> u16 {
-        if self.is_tls { 443 } else { 80 }
+        let upstream_tcp = match tokio::time::timeout(Duration::from_secs(10), connect_fut).await {
+            Ok(res) => res?,
+            Err(_) => return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Connection to {}:{} timed out after 10s", target.host, target.port),
+            ))),
+        };
+
+        if target.is_tls {
+            let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_client_config));
+            let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+                .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
+            let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+            let upstream_io = TokioIo::new(upstream_tls);
+            match self.client_http1_builder.handshake(upstream_io).await {
+                Ok((sender, conn)) => {
+                    let handle = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok((sender, handle.abort_handle()))
+                }
+                Err(e) => Err(ProxyError::Hyper(e)),
+            }
+        } else {
+            let upstream_io = TokioIo::new(upstream_tcp);
+            match self.client_http1_builder.handshake(upstream_io).await {
+                Ok((sender, conn)) => {
+                    let handle = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok((sender, handle.abort_handle()))
+                }
+                Err(e) => Err(ProxyError::Hyper(e)),
+            }
+        }
+    }
+
+    fn connection_pool(&self) -> Arc<ConnectionPool> {
+        Arc::clone(&self.connection_pool)
+    }
+
+    fn bypass_chunk_modification(&self) -> bool {
+        self.bypass_chunk_modification
+    }
+
+    fn disable_pooling(&self) -> bool {
+        self.disable_pooling
+    }
+
+    fn ca(&self) -> Arc<crate::certificate::CertificateAuthority> {
+        Arc::clone(&self.ca)
     }
 }
 
 impl ProxyConfig {
+    /// Returns the connection configuration for this proxy.
+    pub fn connection_config(&self) -> ConnectionConfig {
+        ConnectionConfig {
+            upstream_proxy: self.upstream_proxy.clone(),
+            direct_cdn: self.direct_cdn,
+            bypass_chunk_modification: self.bypass_chunk_modification,
+            disable_pooling: self.disable_pooling,
+            verify_tls: self.verify_tls,
+        }
+    }
+
     pub fn new(
         upstream_url: Option<String>,
         ca: Arc<CertificateAuthority>,
@@ -157,7 +198,7 @@ impl ProxyConfig {
             direct_cdn,
             bypass_chunk_modification,
             disable_pooling,
-            _verify_tls: verify_tls,
+            verify_tls,
         })
     }
 
@@ -178,86 +219,6 @@ impl ProxyConfig {
             }
         }))
     }
-
-    #[inline]
-    pub async fn connect(self: &Arc<Self>, host: &str, port: u16) -> ProxyResult<tokio::net::TcpStream> {
-        use crate::connect::connect_via_proxy;
-
-        let connect_fut = connect_via_proxy(self, host, port);
-
-        match tokio::time::timeout(Duration::from_secs(10), connect_fut).await {
-            Ok(res) => res,
-            Err(_) => Err(ProxyError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Connection to {}:{} timed out after 10s", host, port),
-            ))),
-        }
-    }
-
-    #[inline]
-    async fn handshake_upstream<IO>(
-        &self,
-        io: IO,
-    ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)>
-    where
-        IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-    {
-        match self.client_http1_builder.handshake(io).await {
-            Ok((sender, conn)) => {
-                let handle = tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                Ok((sender, handle.abort_handle()))
-            }
-            Err(e) => Err(ProxyError::Hyper(e)),
-        }
-    }
-
-    pub async fn get_or_create_connection(
-        self: &Arc<Self>,
-        target: &ConnectionTarget,
-    ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)> {
-        // Try to reuse connection from pool only if pooling is enabled
-        if !self.disable_pooling {
-            while let Some((mut sender, abort_handle)) = self.connection_pool.get(&target.host, target.port, target.is_tls) {
-                match sender.ready().await {
-                    Ok(_) => return Ok((sender, abort_handle)),
-                    Err(_) => {
-                        abort_handle.abort();
-                        continue;
-                    }
-                }
-            }
-        }
-
-        let upstream_tcp = self.connect(&target.host, target.port).await?;
-
-        if target.is_tls {
-            let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_client_config));
-            let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
-                .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
-            let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
-            let upstream_io = TokioIo::new(upstream_tls);
-            self.handshake_upstream(upstream_io).await
-        } else {
-            let upstream_io = TokioIo::new(upstream_tcp);
-            self.handshake_upstream(upstream_io).await
-        }
-    }
-}
-
-// Consolidated error response handler
-#[inline]
-pub fn handle_proxy_error(e: &ProxyError, is_connect: bool) -> http::Response<ProxyBody> {
-    let (status, msg) = match e {
-        ProxyError::InvalidUri(_) => (StatusCode::BAD_REQUEST, "Invalid URI"),
-        ProxyError::Io(_) | ProxyError::Socks(_) | ProxyError::Tls(_) => {
-            (StatusCode::BAD_GATEWAY, "Upstream Error")
-        }
-        _ if is_connect => (StatusCode::BAD_GATEWAY, "Upstream Error"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"),
-    };
-    error_response(status, msg)
 }
 
 pub async fn handle_client(
