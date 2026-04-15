@@ -37,6 +37,7 @@ local current_proxy_index = 0
 local blocked_proxies = {}
 local proxy_file = join_path(script_dir, "proxies.txt")
 local cooldown_file = join_path(script_dir, "proxy_cooldowns.json")
+local status_file_path = join_path(script_dir, ".proxy_status")
 
 local function load_proxies()
     proxies = {}
@@ -79,28 +80,6 @@ local function save_cooldowns()
     end
 end
 
-local function is_process_running(pid)
-    if not pid then return false end
-    if is_windows then
-        local check_cmd = 'tasklist /FI "PID eq ' .. pid .. '" /NH'
-        local handle = io.popen(check_cmd)
-        if handle then
-            local result = handle:read("*l") or ""
-            handle:close()
-            return result:find(tostring(pid)) ~= nil
-        end
-    else
-        local check_cmd = "kill -0 " .. pid .. " 2>/dev/null && echo 'running'"
-        local handle = io.popen(check_cmd)
-        if handle then
-            local result = handle:read("*l") or ""
-            handle:close()
-            return result == "running"
-        end
-    end
-    return false
-end
-
 local function get_next_proxy()
     if #proxies == 0 then return nil end
     local now = os.time()
@@ -124,6 +103,7 @@ local function cleanup()
     proxy_ready = false
     proxy_starting = false
     proxy_port = nil
+    os.remove(status_file_path)
 end
 
 local function find_binary()
@@ -162,21 +142,33 @@ local function find_binary()
     return nil
 end
 
-local function check_port_open(port)
-    local null_dev = is_windows and "NUL" or "/dev/null"
-    local res = mp.command_native({
-        name = "subprocess",
-        args = {
-            "curl", "-s", "-o", null_dev,
-            "--max-time", "1.0",
-            "--connect-timeout", "0.5",
-            "http://127.0.0.1:" .. port .. "/"
-        },
-        capture_stdout = false,
-        capture_stderr = false,
-        playback_only = false
-    })
-    return res and (res.status == 0)
+local function check_status_file()
+    local f = io.open(status_file_path, "r")
+    if not f then return nil end
+    local content = f:read("*all")
+    f:close()
+    local port = content:match("READY:(%d+)")
+    return port and tonumber(port)
+end
+
+local function cross_platform_delay(ms)
+    if is_windows then
+        mp.command_native({
+            name = "subprocess",
+            args = {"ping", "-n", "1", "-w", tostring(ms), "127.0.0.1"},
+            capture_stdout = true,
+            capture_stderr = true,
+            playback_only = false
+        })
+    else
+        mp.command_native({
+            name = "subprocess",
+            args = {"sleep", tostring(ms / 1000)},
+            capture_stdout = true,
+            capture_stderr = true,
+            playback_only = false
+        })
+    end
 end
 
 local function apply_proxy_settings()
@@ -187,12 +179,6 @@ local function apply_proxy_settings()
     end
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
-
-    if opts.ytdl_opts_fix == false then
-        opts.ytdl_extractor_profile = "basic"
-    elseif opts.ytdl_opts_fix == true and opts.ytdl_extractor_profile == "ios_m3u8" then
-        opts.ytdl_extractor_profile = "android_vr"
-    end
 
     local ytdl_opts
     if opts.ytdl_extractor_profile == "ios_m3u8" then
@@ -336,8 +322,12 @@ start_proxy_background = function()
         table.insert(args, "--disable-pooling")
     end
 
+    os.remove(status_file_path)
+    table.insert(args, "--status-file")
+    table.insert(args, status_file_path)
+    table.insert(args, "--auto-port")
+
     -- Start proxy asynchronously
-    local pending_port = port_attempt
     mitm_job = mp.command_native_async({
         name = "subprocess",
         args = args,
@@ -357,23 +347,22 @@ start_proxy_background = function()
         mitm_job = nil
     end)
 
-    -- Wait for proxy using synchronous polling with small delays
+    -- Wait for proxy by polling the status file
     -- Note: mpv Lua is single-threaded, async callbacks run when we yield
     local check_count = 0
-    local max_wait = 100  -- 5 seconds total
+    local max_wait = 100
 
     while check_count < max_wait do
-        -- Check if proxy is ready
-        if check_port_open(pending_port) then
-            proxy_port = pending_port
+        local ready_port = check_status_file()
+        if ready_port then
+            proxy_port = ready_port
             proxy_ready = true
             proxy_starting = false
-            mp.msg.info("Proxy ready on port " .. pending_port)
+            mp.msg.info("Proxy ready on port " .. ready_port)
             apply_proxy_settings()
             return
         end
 
-        -- Check if subprocess exited early (callback runs when we yield)
         if mitm_job == nil then
             mp.msg.error("Proxy subprocess exited unexpectedly during startup")
             proxy_starting = false
@@ -381,19 +370,11 @@ start_proxy_background = function()
             return
         end
 
-        -- Small delay using mp.command_native with subprocess
-        -- This yields control and allows async callbacks to run
-        mp.command_native({
-            name = "subprocess",
-            args = {"sleep", "0.05"},
-            playback_only = false
-        })
-
+        cross_platform_delay(50)
         check_count = check_count + 1
     end
 
-    -- Timeout
-    mp.msg.error("Timeout waiting for proxy to start on port " .. pending_port)
+    mp.msg.error("Timeout waiting for proxy to start")
     proxy_starting = false
     cleanup()
 end
@@ -442,8 +423,6 @@ mp.register_event("log-message", function(e)
     end
 end)
 
-mp.add_hook("on_load_fail", 50, function()
-end)
 
 local function show_status()
     local status = (proxy_ready and "🟢" or "🔴")

@@ -55,6 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("UPSTREAM_PROXY").ok())
         .filter(|s| !s.is_empty());
 
+    let status_file = args
+        .iter()
+        .position(|a| a == "--status-file")
+        .and_then(|i| args.get(i + 1).cloned());
+
     let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
     let bypass_chunk_modification = args.iter().any(|a| a == "--bypass-chunk-modification");
     let disable_pooling = args.iter().any(|a| a == "--disable-pooling");
@@ -97,6 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    if let Some(ref path) = status_file {
+        std::fs::write(path, format!("READY:{}\n", port))?;
+    }
     println!("READY:{}", port);
 
     loop {
@@ -111,6 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+    }
+
+    if let Some(ref path) = status_file {
+        let _ = std::fs::remove_file(path);
     }
 
     Ok(())
