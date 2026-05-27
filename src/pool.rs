@@ -12,6 +12,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 
+use tracing::{debug, trace};
+
 use crate::types::ConnectionTarget;
 
 pub const CONNECTION_POOL_SIZE: usize = 100;
@@ -117,6 +119,7 @@ impl ConnectionPool {
             let mut state = self.state.lock();
             if state.1 >= CONNECTION_POOL_SIZE {
                 if let Some((old_key, _)) = state.0.pop_lru() {
+                    debug!(key = ?old_key, reason = "capacity", "Evicting connection from pool");
                     if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
                         let removed_count = conns_mutex.lock().len();
                         state.1 = state.1.saturating_sub(removed_count);
@@ -133,6 +136,7 @@ impl ConnectionPool {
             state.0.put(key.clone(), ());
         }
 
+        debug!(key = ?key, "Returning connection to pool");
         let entry = self
             .pool
             .entry(key)
@@ -147,13 +151,18 @@ impl ConnectionPool {
     /// Removes expired connections from the pool.
     /// Should be called periodically (e.g., every 30 seconds).
     pub fn cleanup(&self) {
+        trace!("Pool cleanup running");
         let mut total_removed = 0;
-        self.pool.retain(|_key, conns_mutex| {
+        self.pool.retain(|key, conns_mutex| {
             let mut conns = conns_mutex.lock();
             let before = conns.len();
             conns.retain(|conn| conn.is_valid());
             let after = conns.len();
-            total_removed += before - after;
+            let removed = before - after;
+            if removed > 0 {
+                debug!(key = ?key, count = removed, reason = "stale", "Evicting stale connections from pool");
+            }
+            total_removed += removed;
 
             after != 0
         });
@@ -344,5 +353,6 @@ pub fn handle_proxy_error(e: &crate::types::ProxyError, is_connect: bool) -> htt
         _ if is_connect => (StatusCode::BAD_GATEWAY, "Upstream Error"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error"),
     };
+    debug!(status = %status.as_u16(), is_connect, error = %e, "Mapping proxy error to HTTP status");
     error_response(status, msg)
 }

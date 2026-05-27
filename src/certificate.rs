@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::{debug, info, trace};
 
 #[derive(Error, Debug)]
 pub enum CertError {
@@ -76,6 +77,7 @@ impl CertificateAuthority {
 
     pub fn new() -> Result<Self, CertError> {
         let ca_data = Self::generate_ca()?;
+        info!("CertificateAuthority created (cache capacity: 100)");
         Ok(Self {
             ca_data: Mutex::new(Some(ca_data)),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())),
@@ -98,7 +100,11 @@ impl CertificateAuthority {
 
     /// Looks up a cached server config for the given hostname.
     fn get_cached_config(&self, hostname: &str) -> Option<Arc<ServerConfig>> {
-        self.cache.lock().get(hostname).cloned()
+        let config = self.cache.lock().get(hostname).cloned();
+        if config.is_some() {
+            trace!("returning cached server config for hostname: {}", hostname);
+        }
+        config
     }
 
     /// Inserts a config into the cache, returning the cached value if one already exists.
@@ -129,6 +135,7 @@ impl CertificateAuthority {
     }
 
     fn generate_server_config(&self, hostname: &str) -> Result<ServerConfig, CertError> {
+        debug!("generating per-hostname certificate for: {}", hostname);
         let ca_data = self.ca_data.lock();
         let ca_data = ca_data
             .as_ref()

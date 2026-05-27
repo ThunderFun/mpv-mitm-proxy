@@ -1,4 +1,5 @@
-use http::{Method, Request};
+use base64::Engine;
+use http::{header::PROXY_AUTHORIZATION, header::PROXY_AUTHENTICATE, Method, Request, StatusCode};
 use std::borrow::Cow;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -6,12 +7,13 @@ use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tracing::{debug, info};
 use url::Url;
 
 use crate::certificate::CertificateAuthority;
 use crate::connect::connect_via_proxy;
 use crate::forward::ConnectionProvider;
-use crate::pool::{ConnectionPool, handle_proxy_error};
+use crate::pool::{ConnectionPool, handle_proxy_error, error_response};
 use crate::tls::{root_certs, NoVerifier};
 
 // Public API types - imported by consumers
@@ -44,6 +46,10 @@ pub struct ProxyConfig {
     /// Kept for potential future features like debug logging, CLI inspection,
     /// or runtime configuration changes.
     pub verify_tls: bool,
+    /// Optional proxy authentication credentials.
+    /// When set, every incoming request must include a valid Proxy-Authorization header.
+    pub proxy_auth_user: Option<String>,
+    pub proxy_auth_pass: Option<String>,
 }
 
 impl ConnectionProvider for ProxyConfig {
@@ -51,20 +57,24 @@ impl ConnectionProvider for ProxyConfig {
         &self,
         target: &ConnectionTarget,
     ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)> {
-        // Try to reuse connection from pool only if pooling is enabled
         if !self.disable_pooling {
             while let Some((mut sender, abort_handle)) = self.connection_pool.get(&target.host, target.port, target.is_tls) {
                 match sender.ready().await {
-                    Ok(_) => return Ok((sender, abort_handle)),
+                    Ok(_) => {
+                        debug!("pool hit for {}:{}:{}", target.host, target.port, if target.is_tls { "tls" } else { "plain" });
+                        return Ok((sender, abort_handle));
+                    }
                     Err(_) => {
+                        debug!("pool connection stale for {}:{}, discarding", target.host, target.port);
                         abort_handle.abort();
                         continue;
                     }
                 }
             }
+            debug!("pool miss for {}:{}:{}", target.host, target.port, if target.is_tls { "tls" } else { "plain" });
         }
 
-        // Establish new connection
+        debug!("establishing new connection to {}:{}:{}", target.host, target.port, if target.is_tls { "tls" } else { "plain" });
         let conn_config = self.connection_config();
         let connect_fut = connect_via_proxy(&conn_config, &target.host, target.port);
 
@@ -81,6 +91,7 @@ impl ConnectionProvider for ProxyConfig {
             let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
                 .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
             let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+            debug!("TLS handshake completed with {}:{}", target.host, target.port);
             let upstream_io = TokioIo::new(upstream_tls);
             match self.client_http1_builder.handshake(upstream_io).await {
                 Ok((sender, conn)) => {
@@ -141,6 +152,8 @@ impl ProxyConfig {
         bypass_chunk_modification: bool,
         disable_pooling: bool,
         verify_tls: bool,
+        proxy_auth_user: Option<String>,
+        proxy_auth_pass: Option<String>,
     ) -> Arc<Self> {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
@@ -168,12 +181,14 @@ impl ProxyConfig {
         });
 
         let tls_client_config = if verify_tls {
+            info!("TLS verification mode: full verification");
             Arc::new(
                 rustls::ClientConfig::builder()
                     .with_root_certificates(root_certs())
                     .with_no_client_auth(),
             )
         } else {
+            info!("TLS verification mode: NoVerifier (certificate verification disabled)");
             Arc::new(
                 rustls::ClientConfig::builder()
                     .dangerous()
@@ -188,6 +203,16 @@ impl ProxyConfig {
         let mut server_http1_builder = hyper::server::conn::http1::Builder::new();
         configure_http1_builder(&mut client_http1_builder, &mut server_http1_builder);
 
+        if let Some(ref proxy) = upstream_proxy {
+            if proxy.username.is_some() {
+                info!("ProxyConfig created with upstream proxy {}://****:****@{}:{}", match proxy.proxy_type { ProxyType::Socks5 => "socks5", ProxyType::Http => "http" }, proxy.host, proxy.port);
+            } else {
+                info!("ProxyConfig created with upstream proxy {}://{}:{}", match proxy.proxy_type { ProxyType::Socks5 => "socks5", ProxyType::Http => "http" }, proxy.host, proxy.port);
+            }
+        } else {
+            info!("ProxyConfig created without upstream proxy");
+        }
+
         Arc::new(Self {
             upstream_proxy,
             ca,
@@ -199,6 +224,8 @@ impl ProxyConfig {
             bypass_chunk_modification,
             disable_pooling,
             verify_tls,
+            proxy_auth_user,
+            proxy_auth_pass,
         })
     }
 
@@ -211,6 +238,7 @@ impl ProxyConfig {
         }
 
         let pool_clone = Arc::clone(&self.connection_pool);
+        info!("starting connection pool cleanup task (interval: 30s)");
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -221,10 +249,55 @@ impl ProxyConfig {
     }
 }
 
+/// Check proxy authentication credentials from the Proxy-Authorization header.
+fn check_proxy_auth(
+    req: &Request<Incoming>,
+    expected_user: &Option<String>,
+    expected_pass: &Option<String>,
+) -> bool {
+    if expected_user.is_none() && expected_pass.is_none() {
+        return true;
+    }
+    let Some(expected_user) = expected_user else { return false };
+    let Some(expected_pass) = expected_pass else { return false };
+
+    let auth_header = match req.headers().get(PROXY_AUTHORIZATION) {
+        Some(h) => h,
+        None => return false,
+    };
+    let auth_str = match auth_header.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let Some(space_pos) = auth_str.find(' ') else {
+        return false;
+    };
+    if auth_str[..space_pos].to_ascii_lowercase() != "basic" {
+        return false;
+    }
+    let credentials = &auth_str[space_pos + 1..];
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(credentials) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+
+    let mut parts = decoded.splitn(2, ':');
+    let user = parts.next().unwrap_or("");
+    let pass = parts.next().unwrap_or("");
+
+    user == expected_user && pass == expected_pass
+}
+
 pub async fn handle_client(
     stream: TcpStream,
     config: Arc<ProxyConfig>,
 ) -> ProxyResult<()> {
+    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    debug!("handle_client() called from {}", peer_addr);
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
 
@@ -232,10 +305,24 @@ pub async fn handle_client(
     let service = service_fn(move |req: Request<Incoming>| {
         let config = Arc::clone(&config_clone);
         let is_connect = req.method() == Method::CONNECT;
+        let peer_addr_value = peer_addr.clone();
         async move {
+            // Enforce proxy authentication if configured
+            if !check_proxy_auth(&req, &config.proxy_auth_user, &config.proxy_auth_pass) {
+                info!("Proxy authentication failed from {}", peer_addr_value);
+                let mut resp = error_response(
+                    StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                    "Proxy Authentication Required",
+                );
+                resp.headers_mut().insert(PROXY_AUTHENTICATE, http::HeaderValue::from_static("Basic realm=\"proxy\""));
+                return Ok::<_, hyper::Error>(resp);
+            }
+
             let result = if is_connect {
+                info!("dispatching handle_connect for {}:{}", req.uri().host().unwrap_or_default(), req.uri().port_u16().unwrap_or(443));
                 handle_connect(req, config).await
             } else {
+                debug!("dispatching handle_http {} {}", req.method(), req.uri());
                 handle_http(req, config).await
             };
 

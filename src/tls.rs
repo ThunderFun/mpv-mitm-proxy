@@ -21,18 +21,22 @@
 /// Uses rustls-native-certs to load the platform's native certificate store.
 /// Falls back gracefully if some certificates fail to load.
 pub fn root_certs() -> rustls::RootCertStore {
+    use tracing::{debug, warn};
+
     let mut root_store = rustls::RootCertStore::empty();
     let cert_result = rustls_native_certs::load_native_certs();
 
     if let Some(e) = cert_result.errors.first() {
-        eprintln!("Warning: some certificates failed to load: {}", e);
+        warn!("some system root certificates failed to load: {}", e);
     }
 
     for cert in cert_result.certs {
         if let Err(e) = root_store.add(cert) {
-            eprintln!("Warning: failed to add certificate: {}", e);
+            warn!("failed to add certificate to root store: {}", e);
         }
     }
+
+    debug!("loaded {} root certificates", root_store.len());
 
     root_store
 }

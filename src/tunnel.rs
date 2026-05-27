@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 
+use tracing::{debug, error, info, warn};
+
 use crate::pool::{empty_body, ProxyBody, handle_proxy_error};
 use crate::types::{ConnectionTarget, ProxyError, ProxyResult};
 use crate::forward::{forward_request, ConnectionProvider};
@@ -26,6 +28,7 @@ where
     P: ConnectionProvider + 'static,
 {
     let (host, port) = extract_host_port(req.uri())?;
+    debug!(host, port, "handle_connect started");
 
     let host_clone = host.clone();
     let upgrade_fut = hyper::upgrade::on(req);
@@ -34,10 +37,12 @@ where
         if let Ok(upgraded) = upgrade_fut.await {
             let upgraded_io = TokioIo::new(upgraded);
             if let Err(_e) = handle_tunnel(upgraded_io, &host_clone, port, config).await {
-                eprintln!("Tunnel error for {}:{}", host_clone, port);
+                error!(host = %host_clone, port, "Tunnel error");
             }
         }
     });
+
+    info!(host = %host, port, "CONNECT tunnel established");
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -58,10 +63,15 @@ where
 #[inline]
 pub fn extract_host_port(uri: &http::Uri) -> ProxyResult<(String, u16)> {
     let auth = uri.authority().ok_or_else(|| {
-        ProxyError::InvalidUri(Cow::Owned(format!("Missing authority in URI: {}", uri)))
+        let err = ProxyError::InvalidUri(Cow::Owned(format!("Missing authority in URI: {}", uri)));
+        warn!(uri = %uri, "CONNECT URI parsing failed: missing authority");
+        err
     })?;
     let url = Url::parse(&format!("https://{}", auth.as_str()))
-        .map_err(|e| ProxyError::InvalidUri(Cow::Owned(e.to_string())))?;
+        .map_err(|e| {
+            warn!(uri = %uri, error = %e, "CONNECT URI parsing failed");
+            ProxyError::InvalidUri(Cow::Owned(e.to_string()))
+        })?;
     Ok((
         url.host_str().unwrap_or("").to_string(),
         url.port().unwrap_or(443),
@@ -88,7 +98,9 @@ where
         .map_err(ProxyError::Certificate)?;
 
     let acceptor = TlsAcceptor::from(tls_config);
+    debug!(host, "TLS handshake with client started");
     let client_tls = acceptor.accept(upgraded).await?;
+    debug!(host, "TLS handshake with client completed");
     let client_io = TokioIo::new(client_tls);
     let host_owned = host.to_string();
 

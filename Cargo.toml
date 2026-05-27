@@ -24,6 +24,8 @@ http = "1.1"
 time = "0.3"
 parking_lot = "0.12"
 http-body = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true

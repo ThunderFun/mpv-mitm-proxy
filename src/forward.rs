@@ -9,6 +9,8 @@ use hyper::body::Incoming;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::pool::{BodyWithAbortHandle, BodyWithPoolReturn, empty_body, ProxyBody};
 use crate::types::{ConnectionTarget, ProxyError, ProxyResult};
 use crate::range::modify_youtube_range_headers;
@@ -50,6 +52,7 @@ pub fn strip_hop_by_hop_headers<T>(req: &mut Request<T>) {
     headers.remove("TE");
     headers.remove("Trailer");
     headers.remove(TRANSFER_ENCODING);
+    headers.remove("Proxy-Authorization");
 }
 
 /// Forwards an HTTP request to the target and returns the response.
@@ -75,15 +78,20 @@ where
 {
     strip_hop_by_hop_headers(&mut req);
 
+    let req_method = req.method().clone();
+    let req_uri = req.uri().clone();
+    debug!(method = %req_method, uri = %req_uri, host = %target.host, "forward_request called");
+
     if provider.bypass_chunk_modification() {
         if target.host.ends_with("googlevideo.com") {
-            println!("[PROXY] Bypassing chunk modification for {}", target.host);
+            debug!(host = %target.host, "Bypassing chunk modification");
         }
     } else if modify_youtube_range_headers(&mut req, &target.host) {
-        println!("[PROXY] Modified Range header for {}", target.host);
+        debug!(host = %target.host, "Modified Range header for YouTube");
     }
 
     let (mut sender, abort_handle) = provider.get_or_create_connection(target).await?;
+    debug!(host = %target.host, port = target.port, "Connection obtained");
 
     let host_header = if target.port == target.default_port() {
         http::HeaderValue::from_str(&target.host)
@@ -107,6 +115,7 @@ where
     parts.headers.insert(HOST, host_header);
 
     let req = Request::from_parts(parts, body);
+    debug!(method = %req_method, uri = %req_uri, "Sending request");
     let resp = match sender.send_request(req).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -116,6 +125,7 @@ where
     };
 
     let (parts, incoming_body) = resp.into_parts();
+    debug!(status = %parts.status.as_u16(), method = %req_method, uri = %req_uri, "Response received");
 
     let can_reuse = parts.status != StatusCode::SWITCHING_PROTOCOLS
         && !matches!(
@@ -168,6 +178,7 @@ where
         .map(|h| h.to_string())
         .ok_or_else(|| ProxyError::InvalidUri(Cow::Borrowed("Missing host")))?;
     let port = uri.port_u16().unwrap_or(80);
+    debug!(method = %req.method(), uri = %uri, host = %host, "handle_http processing request");
     let target = ConnectionTarget { host, port, is_tls: false };
 
     forward_request(req, &target, provider).await

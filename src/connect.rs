@@ -8,6 +8,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_socks::tcp::Socks5Stream;
 
+use tracing::{debug, warn};
+
 use crate::types::{ConnectionConfig, ProxyError, ProxyType, UpstreamProxy};
 
 /// Establishes a connection to the target host via an upstream proxy if configured.
@@ -23,20 +25,35 @@ pub async fn connect_via_proxy(
         Some(proxy) if !use_direct => {
             match proxy.proxy_type {
                 ProxyType::Socks5 => {
+                    debug!(method = "socks5", host, port, "connect_via_proxy called");
                     connect_via_socks5(proxy, host, port).await
                 }
                 ProxyType::Http => {
+                    debug!(method = "http", host, port, "connect_via_proxy called");
                     connect_via_http_proxy(proxy, host, port).await
                 }
             }
         }
-        _ => connect_direct(host, port).await,
+        _ => {
+            debug!(method = "direct", host, port, "connect_via_proxy called");
+            connect_direct(host, port).await
+        }
     }
 }
 
 /// Connects directly to the target host.
 async fn connect_direct(host: &str, port: u16) -> Result<TcpStream, ProxyError> {
-    let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
+    debug!(host, port, "Connecting directly");
+    let stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(s) => {
+            debug!(host, port, "Direct TCP connection established");
+            s
+        }
+        Err(e) => {
+            warn!(host, port, error = %e, "Direct connection failed");
+            return Err(e.into());
+        }
+    };
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -47,6 +64,7 @@ async fn connect_via_socks5(
     host: &str,
     port: u16,
 ) -> Result<TcpStream, ProxyError> {
+    debug!(proxy_host = %proxy.host, proxy_port = proxy.port, host, port, "Connecting via SOCKS5 proxy");
     let stream = match (&proxy.username, &proxy.password) {
         (Some(user), Some(pass)) => {
             Socks5Stream::connect_with_password(
@@ -55,10 +73,20 @@ async fn connect_via_socks5(
                 user,
                 pass,
             )
-            .await?
+            .await
         }
         _ => {
-            Socks5Stream::connect((proxy.host.as_str(), proxy.port), (host, port)).await?
+            Socks5Stream::connect((proxy.host.as_str(), proxy.port), (host, port)).await
+        }
+    };
+    let stream = match stream {
+        Ok(s) => {
+            debug!(host, port, "SOCKS5 connection established");
+            s
+        }
+        Err(e) => {
+            warn!(host, port, error = %e, "SOCKS5 connection failed");
+            return Err(e.into());
         }
     };
     let tcp_stream = stream.into_inner();
@@ -72,7 +100,15 @@ async fn connect_via_http_proxy(
     host: &str,
     port: u16,
 ) -> Result<TcpStream, ProxyError> {
-    let mut tcp_stream = TcpStream::connect(format!("{}:{}", proxy.host, proxy.port)).await?;
+    debug!(proxy_host = %proxy.host, proxy_port = proxy.port, host, port, "Connecting via HTTP proxy");
+
+    let mut tcp_stream = match TcpStream::connect(format!("{}:{}", proxy.host, proxy.port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(host = %proxy.host, port = proxy.port, error = %e, "HTTP proxy TCP connection failed");
+            return Err(e.into());
+        }
+    };
     let _ = tcp_stream.set_nodelay(true);
 
     let connect_req = build_http_connect_request(host, port, &proxy.username, &proxy.password);
@@ -85,15 +121,18 @@ async fn connect_via_http_proxy(
     // Check for successful response
     if !buf[..response_len].starts_with(b"HTTP/1.1 200") && !buf[..response_len].starts_with(b"HTTP/1.0 200") {
         let first_line = buf[..response_len].split(|&b| b == b'\n').next().unwrap_or(&[]);
+        let status_line = String::from_utf8_lossy(first_line).trim().to_string();
+        warn!(host, port, status = %status_line, "HTTP CONNECT failed");
         return Err(ProxyError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             format!(
                 "HTTP proxy CONNECT failed: {}",
-                String::from_utf8_lossy(first_line).trim()
+                status_line
             ),
         )));
     }
 
+    debug!(host, port, status = 200, "HTTP CONNECT succeeded");
     Ok(tcp_stream)
 }
 

@@ -64,6 +64,7 @@ The following options are defined in the Lua script with default values. You can
 | :--- | :--- | :--- |
 | `use_proxies` | `false` | Enable or disable the use of upstream proxies. |
 | `proxy_rotation_enabled` | `false` | Enable proxy rotation when a proxy is blocked. |
+| `auto_restart_on_failure` | `false` | On failure, automatically restart with the next proxy available. |
 | `cooldown_hours` | `16` | How long to block a proxy after a bot challenge. |
 | `fallback_to_direct` | `false` | Use a direct connection if all proxies are blocked. |
 | `direct_cdn` | `false` | Experimental: Use direct connection for CDN connections. |
@@ -71,7 +72,9 @@ The following options are defined in the Lua script with default values. You can
 | `bypass_chunk_modification` | `false` | Disable chunk modification. |
 | `verify_tls` | `false` | Verify TLS certificates from upstream servers. |
 | `disable_pooling` |  `true` | Disable pooling. |
+| `enable_proxy_auth` |  `true` | Proxy authentication between the binary and lua script. |
 | `max_resolution` | `2160` | Maximum video resolution for the `ios_m3u8` extractor profile. |
+| `debug` |  `false` | Enable debug output. |
 
 Example command line usage:
 ```bash
