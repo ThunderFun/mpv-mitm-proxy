@@ -59,6 +59,10 @@ local function is_path_shell_safe(path)
     return true
 end
 
+-- Detect the host OS: package.config:sub(1,1) is '/' on Unix, '\\' on Windows.
+local is_windows = package.config:sub(1, 1) == "\\"
+local path_sep = is_windows and "\\" or "/"
+
 local mitm_job = nil
 local proxy_port = nil
 local proxy_ready = false
@@ -69,10 +73,6 @@ local proxy_auth_pass = nil
 local script_dir = mp.get_script_directory() or "."
 local proxy_binary = is_windows and "mpv-mitm-proxy.exe" or "mpv-mitm-proxy"
 
--- OS detection: package.config:sub(1,1) is '/' on Unix, '\\' on Windows
-local is_windows = package.config:sub(1, 1) == "\\"
-local path_sep = is_windows and "\\" or "/"
-
 local function join_path(...)
     local parts = {...}
     return table.concat(parts, path_sep)
@@ -81,7 +81,6 @@ end
 local proxies = {}
 local current_proxy_index = 0
 local blocked_proxies = {}
-local rotating = false
 local proxy_file = join_path(script_dir, "proxies.txt")
 local cooldown_file = join_path(script_dir, "proxy_cooldowns.json")
 local status_file_path = join_path(script_dir, ".proxy_status")
@@ -267,26 +266,6 @@ local function check_status_file(custom_path)
     return port and tonumber(port), err
 end
 
-local function cross_platform_delay(ms)
-    if is_windows then
-        mp.command_native({
-            name = "subprocess",
-            args = {"ping", "-n", "1", "-w", tostring(ms), "127.0.0.1"},
-            capture_stdout = true,
-            capture_stderr = true,
-            playback_only = false
-        })
-    else
-        mp.command_native({
-            name = "subprocess",
-            args = {"sleep", tostring(ms / 1000)},
-            capture_stdout = true,
-            capture_stderr = true,
-            playback_only = false
-        })
-    end
-end
-
 local function apply_proxy_settings()
     if not proxy_port then
         mp.set_property("file-local-options/http-proxy", "")
@@ -303,20 +282,18 @@ local function apply_proxy_settings()
 
     local ytdl_opts
     if opts.ytdl_extractor_profile == "ios_m3u8" then
-        -- iOS client with m3u8_native format selection
+        -- iOS player client with m3u8_native format selection and resolution cap.
         ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=ios,formats=missing_pot",format="bv[protocol=m3u8_native][height<=' .. opts.max_resolution .. ']+ba/b"'
     elseif opts.ytdl_extractor_profile == "android_vr" then
-        -- android_vr client
+        -- Android VR player client (default profile).
         ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=android_vr,-android_sdkless"'
     else
-        -- "basic" or any other value: minimal options only
+        -- Minimal yt-dlp options for the "basic" extractor profile.
         ytdl_opts = "proxy=" .. px .. ",force-ipv4=,no-check-certificates=,"
     end
 
     mp.set_property("file-local-options/ytdl-raw-options", ytdl_opts)
 end
-
-local start_proxy_background
 
 local function is_ytdl_applicable()
     local path = mp.get_property("path")
@@ -347,139 +324,17 @@ local function is_ytdl_applicable()
     return true
 end
 
-local function on_load_hook()
-    dprint("on_load_hook triggered")
-    if not is_ytdl_applicable() then
-        return
-    end
-    if not proxy_port and not proxy_starting then
-        if proxy_ready then
-            apply_proxy_settings()
-        else
-            start_proxy_background()
-            if proxy_ready then
-                apply_proxy_settings()
-            end
-        end
-    end
-end
+--------------------------------------------------------------------------------
+-- Async proxy startup
+--
+-- All proxy startup is fully asynchronous. Status-file polling is driven by
+-- mp.add_timeout(), which yields back to mpv between checks. This keeps the
+-- UI responsive and lets the subprocess-exit callback fire promptly if the
+-- binary dies during startup.
+--------------------------------------------------------------------------------
 
-local function on_start_file()
-    dprint("on_start_file triggered")
-    if not is_ytdl_applicable() then
-        return
-    end
-
-    if not proxy_port and not proxy_starting then
-        start_proxy_background()
-    end
-
-    if proxy_ready then
-        apply_proxy_settings()
-    end
-end
-
--- Launch a single proxy instance and wait for its READY status.
-local function try_start_single_proxy(bin, upstream)
-    math.randomseed(os.time() + math.random(1, 1000))
-    local port_attempt = math.random(15000, 25000)
-
-    local args = {bin, "--port", tostring(port_attempt)}
-    if upstream then
-        table.insert(args, "--upstream")
-        table.insert(args, upstream)
-    end
-    if opts.direct_cdn then
-        table.insert(args, "--direct-cdn")
-    end
-    if opts.bypass_chunk_modification then
-        table.insert(args, "--bypass-chunk-modification")
-    end
-    if opts.verify_tls then
-        table.insert(args, "--verify-tls")
-    end
-    if opts.disable_pooling then
-        table.insert(args, "--disable-pooling")
-    end
-    if proxy_auth_user and proxy_auth_pass then
-        table.insert(args, "--proxy-auth-user")
-        table.insert(args, proxy_auth_user)
-        table.insert(args, "--proxy-auth-pass")
-        table.insert(args, proxy_auth_pass)
-    end
-    if opts.debug then
-        table.insert(args, "--verbose")
-    end
-
-    os.remove(status_file_path)
-    local unique_status_file = status_file_path .. "." .. tostring(port_attempt)
-    os.remove(unique_status_file)
-    table.insert(args, "--status-file")
-    table.insert(args, unique_status_file)
-    table.insert(args, "--auto-port")
-    dprint("CLI arguments: " .. dump_table(args))
-
-    proxy_generation = proxy_generation + 1
-    local my_generation = proxy_generation
-
-    mitm_job = mp.command_native_async({
-        name = "subprocess",
-        args = args,
-        capture_stdout = not opts.debug,
-        capture_stderr = not opts.debug,
-        playback_only = false
-    }, function(success, result, error)
-        if my_generation ~= proxy_generation then return end
-        if not success or (result and result.status ~= 0) then
-            local err_msg = "Proxy subprocess failed"
-            if error then err_msg = err_msg .. ": " .. error end
-            if result and result.status then err_msg = err_msg .. " (status: " .. result.status .. ")" end
-            dprint("Proxy process exited (output was not captured, check terminal)")
-            mp.msg.error(err_msg)
-        end
-        proxy_ready = false
-        proxy_starting = false
-        proxy_port = nil
-        mitm_job = nil
-    end)
-    dprint("subprocess launched, pid via job handle")
-
-    local check_count = 0
-    local max_wait = 100
-    dprint("starting status file poll, path=" .. unique_status_file .. ", timeout=~5s")
-
-    while check_count < max_wait do
-        check_count = check_count + 1
-        if check_count % 10 == 0 then
-            dprint("poll iteration " .. check_count .. "/" .. max_wait .. ", still waiting...")
-        end
-        dprint("poll iteration " .. check_count .. "/" .. max_wait .. ", checking status file")
-        local ready_port, status_err = check_status_file(unique_status_file)
-        if status_err then
-            os.remove(unique_status_file)
-            cleanup()
-            return nil, status_err
-        end
-        if ready_port then
-            os.remove(unique_status_file)
-            return ready_port, nil
-        end
-
-        if mitm_job == nil and my_generation == proxy_generation then
-            mp.msg.error("Proxy subprocess exited unexpectedly during startup")
-            os.remove(unique_status_file)
-            cleanup()
-            return nil, "Proxy subprocess exited unexpectedly during startup"
-        end
-
-        cross_platform_delay(50)
-    end
-
-    os.remove(unique_status_file)
-    cleanup()
-    return nil, "Timeout waiting for proxy to start"
-end
-
+-- Launch a single proxy instance and poll its status file asynchronously.
+-- Calls on_ready(ready_port) on success or on_failed(err) on failure/timeout.
 local function try_start_single_proxy_async(bin, upstream, on_ready, on_failed)
     math.randomseed(os.time() + math.random(1, 1000))
     local port_attempt = math.random(15000, 25000)
@@ -532,6 +387,8 @@ local function try_start_single_proxy_async(bin, upstream, on_ready, on_failed)
     }, function(success, result, error)
         if my_generation ~= proxy_generation then return end
         if completed then return end
+        -- Fail fast if the process exits during startup rather than waiting
+        -- for the full poll timeout.
         if proxy_starting then
             mp.msg.error("Proxy subprocess exited unexpectedly during async startup")
             completed = true
@@ -540,7 +397,7 @@ local function try_start_single_proxy_async(bin, upstream, on_ready, on_failed)
     end)
 
     local poll_count = 0
-    local max_polls = 100
+    local max_polls = 100  -- ~5s at 50ms intervals
 
     local function poll()
         if completed then return end
@@ -578,6 +435,8 @@ local function try_start_single_proxy_async(bin, upstream, on_ready, on_failed)
     mp.add_timeout(0.1, poll)
 end
 
+-- Start the proxy, optionally rotating across upstreams, and invoke
+-- on_complete(true) on success or on_complete(false) on failure.
 local function start_proxy_async(on_complete)
     dprint("start_proxy_async() called")
     if proxy_starting then
@@ -596,6 +455,8 @@ local function start_proxy_async(on_complete)
 
     proxy_starting = true
 
+    -- One-shot health check: run the binary with "init" to verify it exists
+    -- and is executable before committing to a full startup.
     local test_res = mp.command_native({
         name = "subprocess",
         args = {bin, "init"},
@@ -612,6 +473,7 @@ local function start_proxy_async(on_complete)
         return
     end
 
+    -- Generate per-session proxy authentication credentials.
     proxy_auth_user = nil
     proxy_auth_pass = nil
     if opts.enable_proxy_auth then
@@ -672,6 +534,7 @@ local function start_proxy_async(on_complete)
         end, function(err)
             mp.msg.warn("Proxy startup failed for " .. (upstream and proxy_label(upstream) or "direct") .. ": " .. err)
             cleanup()
+            -- Retry with the next available upstream after a brief delay.
             mp.add_timeout(0.5, try_next)
         end)
     end
@@ -679,122 +542,77 @@ local function start_proxy_async(on_complete)
     try_next()
 end
 
-start_proxy_background = function()
-    dprint("start_proxy_background() called")
-    -- Guard against concurrent startup attempts
-    if proxy_starting then
-        dprint("Proxy startup already in progress, skipping duplicate request")
-        return
+--------------------------------------------------------------------------------
+-- mpv hook integration
+--
+-- mpv hooks run synchronously: we must return quickly. When the proxy is not
+-- ready yet we initiate an async startup and return immediately. The file
+-- then loads once (without the proxy); when the proxy comes up we reload the
+-- file so yt-dlp re-runs with the proxy applied. The reload's on_load sees
+-- proxy_ready == true and only applies settings (no further reload), so there
+-- is no loop.
+--------------------------------------------------------------------------------
+
+-- Monotonic token to keep track of which load cycle requested a startup, so a
+-- stale callback never reloads an unrelated file.
+local load_token = 0
+
+local function reload_current_file()
+    local path = mp.get_property("path")
+    if path then
+        mp.commandv("loadfile", path, "replace")
     end
-    if mitm_job then cleanup() end
-
-    dprint("passed concurrency guard, starting binary search")
-    local bin = find_binary()
-    if not bin then
-        dprint("find_binary() returned nil")
-        return
-    end
-    dprint("find_binary() returned: " .. tostring(bin))
-
-    proxy_starting = true
-    dprint("Starting proxy...")
-
-    -- Check if binary is executable and works
-    dprint("running init health check on binary")
-    local test_res = mp.command_native({
-        name = "subprocess",
-        args = {bin, "init"},
-        capture_stdout = not opts.debug,
-        capture_stderr = not opts.debug,
-        playback_only = false
-    })
-    if not test_res or test_res.status ~= 0 then
-        local err = (test_res and test_res.error) or "unknown error"
-        local status = (test_res and test_res.status) or "N/A"
-        local stderr = (test_res and test_res.stderr) or ""
-        local stdout = (test_res and test_res.stdout) or ""
-        dprint("init health check failed: error=" .. tostring(err) .. ", status=" .. tostring(status))
-        mp.msg.error(string.format("[mpv_mitm_proxy] Subprocess failed: init (error: %s, status: %s)", err, status))
-        if stdout ~= "" then mp.msg.error("Stdout: " .. stdout) end
-        if stderr ~= "" then mp.msg.error("Stderr: " .. stderr) end
-        proxy_starting = false
-        return
-    end
-    dprint("init health check passed")
-
-    -- Generate per-session proxy auth credentials if enabled
-    proxy_auth_user = nil
-    proxy_auth_pass = nil
-    if opts.enable_proxy_auth then
-        proxy_auth_user = generate_random_string(16)
-        proxy_auth_pass = generate_random_string(32)
-        dprint("Generated proxy auth credentials")
-    end
-
-    local upstream_list_mode = opts.use_proxies and opts.proxy_rotation_enabled
-    local max_retries = 1
-    if upstream_list_mode then
-        max_retries = 0
-        if opts.fallback_to_direct then
-            -- proxies + direct fallback
-            max_retries = #proxies + 1
-        else
-            max_retries = #proxies
-        end
-        if max_retries <= 0 then max_retries = 1 end
-    end
-
-    local attempt_num = 0
-    while attempt_num < max_retries do
-        attempt_num = attempt_num + 1
-        local should_retry = false
-
-        local upstream = nil
-        if opts.use_proxies then
-            upstream = get_next_proxy()
-            if not upstream and not opts.fallback_to_direct then
-                mp.osd_message("All proxies are blocked!", 5)
-                proxy_starting = false
-                return
-            end
-        end
-
-        if upstream then
-            dprint("startup attempt " .. attempt_num .. "/" .. max_retries .. ", upstream: " .. proxy_label(upstream))
-        else
-            dprint("startup attempt " .. attempt_num .. "/" .. max_retries .. ", direct (no upstream proxy)")
-        end
-
-        local ready_port, status_err = try_start_single_proxy(bin, upstream)
-        if not ready_port then
-            mp.msg.warn("Proxy startup failed for " .. (upstream and proxy_label(upstream) or "direct") .. ": " .. status_err)
-            should_retry = true
-        end
-
-        if not should_retry then
-            proxy_port = ready_port
-            proxy_ready = true
-            proxy_starting = false
-            mp.msg.info("Proxy ready on port " .. ready_port .. (upstream and " via " .. proxy_label(upstream) or " (direct)"))
-            apply_proxy_settings()
-            return
-        end
-
-        cross_platform_delay(500)
-    end
-
-    mp.msg.error("All proxy attempts exhausted")
-    proxy_starting = false
-    cleanup()
 end
 
-local function rotate_proxy()
-    if rotating then
-        dprint("Rotation already in progress, ignoring duplicate request")
+-- Called from the load hooks. Starts the proxy if needed and applies settings
+-- when ready. Never blocks.
+local function ensure_proxy_started()
+    dprint("ensure_proxy_started() called, proxy_ready=" .. tostring(proxy_ready) .. ", proxy_starting=" .. tostring(proxy_starting))
+    if not is_ytdl_applicable() then
         return
     end
-    rotating = true
 
+    if proxy_ready then
+        -- Proxy already running: apply settings for the current file and return.
+        apply_proxy_settings()
+        return
+    end
+
+    if proxy_starting then
+        -- A startup is already in progress; the pending callback will reload
+        -- when it completes.
+        return
+    end
+
+    load_token = load_token + 1
+    local token = load_token
+    dprint("kickoff async proxy startup, token=" .. tostring(token))
+
+    start_proxy_async(function(success)
+        if success and proxy_ready and token == load_token then
+            -- Reload so yt-dlp runs with the newly applied proxy settings.
+            dprint("proxy became ready, reloading file to apply proxy (token=" .. tostring(token) .. ")")
+            reload_current_file()
+        end
+    end)
+end
+
+local function on_load_hook()
+    dprint("on_load_hook triggered")
+    ensure_proxy_started()
+end
+
+local function on_start_file()
+    dprint("on_start_file triggered")
+    ensure_proxy_started()
+end
+
+-- Mark the current upstream as blocked, tear down the running proxy, and
+-- reload the current file. The reload triggers ensure_proxy_started(), which
+-- starts a fresh proxy with the next available upstream and re-reloads once
+-- ready. Reloading immediately (rather than waiting for the new proxy)
+-- prevents mpv from holding open a connection that can no longer succeed.
+local function rotate_proxy()
     local blocked_url = proxies[current_proxy_index]
     dprint("rotating proxy, current: " .. tostring(blocked_url or "none") .. ", blocked count: " .. tostring(#blocked_proxies))
     if blocked_url then
@@ -805,18 +623,10 @@ local function rotate_proxy()
     end
     cleanup()
 
-    start_proxy_async(true, function(success)
-        rotating = false
-        if success and proxy_ready then
-            local path = mp.get_property("path")
-            if path then
-                mp.commandv("loadfile", path, "replace")
-            end
-        else
-            mp.msg.warn("Rotation failed, all proxies exhausted")
-            mp.osd_message("All proxies blocked!", 5)
-        end
-    end)
+    local path = mp.get_property("path")
+    if path then
+        mp.commandv("loadfile", path, "replace")
+    end
 end
 
 mp.add_hook("on_load", -1, on_load_hook)
@@ -836,6 +646,14 @@ mp.register_event("log-message", function(e)
     if e.prefix == "ytdl_hook" then
         local msg = e.text:lower()
         if msg:find("sign in") and msg:find("bot") then
+            -- During proxy startup the file loads without a proxy, which can
+            -- trigger bot detection. Ignore it; the file will be reloaded with
+            -- the new proxy once startup completes.
+            if proxy_starting then
+                dprint("Ignoring bot detection while proxy is starting")
+                return
+            end
+
             local blocked_url = proxies[current_proxy_index]
             if blocked_url then
                 blocked_proxies[blocked_url] = os.time()
@@ -851,12 +669,7 @@ mp.register_event("log-message", function(e)
                 end
                 recent_load_attempts = recent_load_attempts + 1
                 mp.msg.warn("Bot detection detected, auto-rotating (attempt " .. tostring(recent_load_attempts) .. "/5)")
-                cleanup()
-                local path = mp.get_property("path")
-                if path then
-                    mp.osd_message("Proxy blocked, rotating...", 3)
-                    mp.commandv("loadfile", path, "replace")
-                end
+                rotate_proxy()
             else
                 mp.osd_message("Proxy blocked! Reload to rotate.", 5)
                 mp.msg.warn("Bot detection detected, proxy marked as blocked. Reload to use a different proxy.")
