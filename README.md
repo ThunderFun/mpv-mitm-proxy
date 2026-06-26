@@ -1,17 +1,15 @@
 # Rust MITM Proxy for mpv
 
-A high-performance MITM proxy that enables seamless YouTube streaming in mpv, with optional support for upstream proxies and automatic stream optimization.
+A local MITM proxy for playing YouTube streams in mpv. Supports upstream proxies and modifies request headers for reliable playback.
 
 ## Features
 
 - **MITM Proxy**: Re-signs HTTPS traffic on the fly using an ephemeral internal CA.
-- **Stream Optimization**: Transparently modifies specific request headers to ensure consistent stream delivery and compatibility with various network environments.
+- **Stream Modification**: Modifies YouTube request headers for reliable stream delivery.
 - **Optional Upstream Support**: Can connect to an upstream HTTP/HTTPS/SOCKS5 proxy if needed.
 - **Proxy Rotation**: Automatically rotates through a list of proxies when a "bot challenge" is detected.
 - **Cooldown System**: Automatically puts blocked proxies on a 16-hour cooldown (configurable).
-- **mpv Integration**: Includes a Lua script for seamless integration with the mpv media player.
-- **Connection Pooling**: Efficiently reuses connections for improved performance and reduced latency.
-- **Performance**: Built with Rust and Tokio for high performance and low resource usage.
+- **mpv Integration**: Includes a Lua script for mpv.
 
 ## Prerequisites
 

@@ -22,7 +22,7 @@ pub const CONNECTION_TTL: Duration = Duration::from_secs(60);
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 pub struct PooledConnection {
-    sender: Option<SendRequest<Incoming>>,
+    sender: Option<SendRequest<ProxyBody>>,
     created_at: Instant,
     abort_handle: AbortHandle,
 }
@@ -32,7 +32,7 @@ impl PooledConnection {
         self.created_at.elapsed() < CONNECTION_TTL && self.sender.is_some()
     }
 
-    pub fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
+    pub fn take(mut self) -> Option<(SendRequest<ProxyBody>, AbortHandle)> {
         self.sender.take().map(|sender| {
             let handle = std::mem::replace(
                 &mut self.abort_handle,
@@ -76,7 +76,7 @@ impl ConnectionPool {
         host: &str,
         port: u16,
         is_tls: bool,
-    ) -> Option<(SendRequest<Incoming>, AbortHandle)> {
+    ) -> Option<(SendRequest<ProxyBody>, AbortHandle)> {
         let key: ConnKey = (host.to_string(), port, is_tls);
 
         loop {
@@ -110,7 +110,7 @@ impl ConnectionPool {
         host: String,
         port: u16,
         is_tls: bool,
-        sender: SendRequest<Incoming>,
+        sender: SendRequest<ProxyBody>,
         abort_handle: AbortHandle,
     ) {
         let key: ConnKey = (host, port, is_tls);
@@ -179,7 +179,7 @@ pub struct BodyWithPoolReturn {
     inner: Incoming,
     pool: Arc<ConnectionPool>,
     target: Option<ConnectionTarget>,
-    sender: Option<SendRequest<Incoming>>,
+    sender: Option<SendRequest<ProxyBody>>,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -189,7 +189,7 @@ impl BodyWithPoolReturn {
         inner: Incoming,
         pool: Arc<ConnectionPool>,
         target: ConnectionTarget,
-        sender: SendRequest<Incoming>,
+        sender: SendRequest<ProxyBody>,
         abort_handle: AbortHandle,
     ) -> Self {
         Self {

@@ -13,7 +13,7 @@ use url::Url;
 use crate::certificate::CertificateAuthority;
 use crate::connect::connect_via_proxy;
 use crate::forward::ConnectionProvider;
-use crate::pool::{ConnectionPool, handle_proxy_error, error_response};
+use crate::pool::{ConnectionPool, handle_proxy_error, error_response, ProxyBody};
 use crate::tls::{root_certs, NoVerifier};
 
 // Public API types - imported by consumers
@@ -56,7 +56,7 @@ impl ConnectionProvider for ProxyConfig {
     async fn get_or_create_connection(
         &self,
         target: &ConnectionTarget,
-    ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<Incoming>, tokio::task::AbortHandle)> {
+    ) -> ProxyResult<(hyper::client::conn::http1::SendRequest<ProxyBody>, tokio::task::AbortHandle)> {
         if !self.disable_pooling {
             while let Some((mut sender, abort_handle)) = self.connection_pool.get(&target.host, target.port, target.is_tls) {
                 match sender.ready().await {

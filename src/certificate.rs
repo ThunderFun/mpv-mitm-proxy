@@ -24,8 +24,8 @@
 use lru::LruCache;
 use parking_lot::Mutex;
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -45,7 +45,7 @@ pub enum CertError {
 }
 
 struct CaData {
-    ca_cert: Certificate,
+    ca_params: CertificateParams,
     ca_key: KeyPair,
 }
 
@@ -71,8 +71,9 @@ impl CertificateAuthority {
         let now = OffsetDateTime::now_utc();
         ca_params.not_before = now;
         ca_params.not_after = now + Duration::from_secs(365 * 24 * 60 * 60 * 10);
-        let ca_cert = ca_params.self_signed(&ca_key)?;
-        Ok(CaData { ca_cert, ca_key })
+        // Validate CA params by self-signing (result not needed, we use params + key as Issuer)
+        let _ = ca_params.self_signed(&ca_key)?;
+        Ok(CaData { ca_params, ca_key })
     }
 
     pub fn new() -> Result<Self, CertError> {
@@ -165,8 +166,8 @@ impl CertificateAuthority {
         server_params.not_before = now;
         server_params.not_after = now + Duration::from_secs(24 * 60 * 60 * 30);
 
-        let server_cert =
-            server_params.signed_by(&server_key, &ca_data.ca_cert, &ca_data.ca_key)?;
+        let issuer = Issuer::new(ca_data.ca_params.clone(), &ca_data.ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer)?;
 
         let cert_der = CertificateDer::from(server_cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));

@@ -82,6 +82,61 @@ pub fn push_u64(buf: &mut Vec<u8>, n: u64) {
     buf.extend_from_slice(itoa_buf.format(n).as_bytes());
 }
 
+/// Parses a byte range header value into (start, Option<end>).
+///
+/// Handles both open-ended ("bytes=start-") and closed ("bytes=start-end") ranges.
+///
+/// # Returns
+/// - `Some((start, Some(end)))` for a closed range
+/// - `Some((start, None))` for an open-ended range
+/// - `None` if the format is invalid
+#[allow(dead_code)]
+pub fn parse_range_start_end(range_bytes: &[u8]) -> Option<(u64, Option<u64>)> {
+    if !range_bytes.starts_with(b"bytes=") {
+        return None;
+    }
+    let rest = &range_bytes[6..];
+    let dash_pos = rest.iter().position(|&b| b == b'-')?;
+    let start_bytes = &rest[..dash_pos];
+    if start_bytes.is_empty() {
+        return None;
+    }
+    let start = parse_u64_digits(start_bytes)?;
+    let end_bytes = &rest[dash_pos + 1..];
+    let end = if end_bytes.is_empty() {
+        None
+    } else {
+        Some(parse_u64_digits(end_bytes)?)
+    };
+    Some((start, end))
+}
+
+#[allow(dead_code)]
+fn parse_u64_digits(b: &[u8]) -> Option<u64> {
+    if b.is_empty() { return None; }
+    let mut v: u64 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() { return None; }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+    }
+    Some(v)
+}
+
+/// Builds a byte range header value that may be open-ended or closed.
+///
+/// - `build_range_value(start, Some(end))` → `bytes=start-end`
+/// - `build_range_value(start, None)` → `bytes=start-`
+pub fn build_range_value(start: u64, end: Option<u64>) -> Option<http::HeaderValue> {
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(b"bytes=");
+    push_u64(&mut buf, start);
+    buf.push(b'-');
+    if let Some(e) = end {
+        push_u64(&mut buf, e);
+    }
+    http::HeaderValue::from_bytes(&buf).ok()
+}
+
 /// Modifies Range headers for YouTube (googlevideo.com) requests to optimize streaming.
 /// Changes open-ended byte ranges (bytes=start-) to fixed-size chunks (bytes=start-end).
 /// Returns true if the header was modified, false otherwise.

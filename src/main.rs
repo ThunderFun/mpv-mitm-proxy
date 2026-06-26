@@ -10,6 +10,7 @@ mod forward;
 mod pool;
 mod proxy;
 mod range;
+mod resume;
 mod tls;
 mod tunnel;
 mod types;
@@ -50,7 +51,7 @@ fn init_tracing(verbose: bool) {
 
 /// Write an error to the status file (if configured) so the Lua script can detect startup failures.
 fn write_error_status(status_file: &Option<String>, msg: &str) {
-    if let Some(ref path) = status_file {
+    if let Some(path) = status_file {
         let _ = std::fs::write(path, format!("ERROR:{}\n", msg));
     }
 }
