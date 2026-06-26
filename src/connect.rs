@@ -75,7 +75,7 @@ fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn set_keepalive(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+    use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket};
     let raw_socket = stream.as_raw_socket();
     let sock = unsafe { socket2::Socket::from_raw_socket(raw_socket) };
     let ka = socket2::TcpKeepalive::new()
