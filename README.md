@@ -1,3 +1,5 @@
+> **Deprecated for versions above v0.41.0 stable. Use [mpv-proxy-rotate](https://github.com/ThunderFun/mpv-proxy-rotate) if you need the proxy functionality.**
+
 # Rust MITM Proxy for mpv
 
 A local MITM proxy for playing YouTube streams in mpv. Supports upstream proxies and modifies request headers for reliable playback.
